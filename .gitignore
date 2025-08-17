@@ -16,3 +16,28 @@ env/
 # *.npz
 # *.jsonl
 # *.log
+# virtual envs
+myenv_clean/
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# build artifacts
+*.egg-info/
+dist/
+build/
+
+# notebooks + IDE
+.ipynb_checkpoints/
+.vscode/
+*.DS_Store
+
+# data / logs (tweak to taste)
+*.npy
+*.jsonl
+logs/
+artifacts/
