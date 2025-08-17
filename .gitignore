@@ -1,0 +1,18 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+myenv_clean/
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# (optional) generated artifacts — uncomment if you don't want these tracked
+# *.npy
+# *.npz
+# *.jsonl
+# *.log
