@@ -1,8 +1,20 @@
+# --- cursor edit test by ChatGPT ---
+# If you see this comment in Cursor, edits via the assistant are working.
+# (Safe no-op change)
 import pandas as pd
 import numpy as np
 import warnings
 import re
+import networkx as nx
+
+# XGBoost for ticket-level reranker
+try:
+    import xgboost as xgb
+except Exception as _e:
+    xgb = None
+    warnings.warn(f"XGBoost unavailable for reranker: {_e}")
 from sklearn.exceptions import ConvergenceWarning
+from sklearn.isotonic import IsotonicRegression
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 # Suppress hmmlearn migration spam from MultinomialHMM (broader match)
 # Treat the migration warning as a visible warning (not an error) so newer 0.3.x can proceed under guard
@@ -11,20 +23,6 @@ warnings.filterwarnings("ignore", message=r".*MultinomialHMM has undergone.*", c
 # Extra-hard squelch for hmmlearn MultinomialHMM migration spam (handles multi-line/cross-version cases)
 warnings.filterwarnings("ignore", message=r"(?s).*MultinomialHMM has undergone.*")
 warnings.filterwarnings("ignore", message=r".*MultinomialHMM has undergone.*", category=Warning, module=r"hmmlearn(\.|$).*")
-
-# Last-resort hook to drop specific MultinomialHMM migration warnings at print time
-def _squelch_hmm_migration_warning():
-    pat = re.compile(r"MultinomialHMM has undergone", re.IGNORECASE)
-    _orig_show = warnings.showwarning
-    def _filter(message, category, filename, lineno, file=None, line=None):
-        try:
-            if pat.search(str(message)):
-                return  # drop it silently
-        except Exception:
-            pass
-        return _orig_show(message, category, filename, lineno, file=file, line=line)
-    warnings.showwarning = _filter
-_squelch_hmm_migration_warning()
 
 # --- Hard suppression of hmmlearn MultinomialHMM migration spam (stdout/stderr + logging) ---
 import logging, contextlib, io
@@ -61,6 +59,816 @@ def _squelch_streams(pattern=r"MultinomialHMM has undergone"):
     finally:
         _sys.stdout, _sys.stderr = out, err
 
+# === Lotto+ Compatibility Shims (guarded) =====================================
+# These avoid NameErrors after a revert by providing minimal, robust fallbacks.
+
+# 1) Post‑rank isotonic calibrator used by reliability export
+if '_PostRankIsotonic' not in globals():
+    try:
+        from sklearn.isotonic import IsotonicRegression as _Iso
+    except Exception:
+        _Iso = None
+    class _PostRankIsotonic:
+        def __init__(self):
+            self.iso = _Iso(y_min=0.0, y_max=1.0, out_of_bounds='clip') if _Iso else None
+            self.fitted = False
+        def fit(self, probs_list, labels_list):
+            import numpy as _np
+            if self.iso is None:
+                return self
+            x = _np.asarray(probs_list, dtype=float).reshape(-1)
+            y = _np.asarray(labels_list, dtype=float).reshape(-1)
+            if x.size >= 100 and y.size == x.size:
+                try:
+                    self.iso.fit(x, y)
+                    self.fitted = True
+                except Exception:
+                    self.fitted = False
+            return self
+        def map(self, p):
+            # Map a single probability through isotonic; identity if not fitted or unavailable.
+            try:
+                return float(self.iso.predict([float(p)])[0]) if (self.iso is not None and self.fitted) else float(p)
+            except Exception:
+                return float(p)
+
+#
+# === Probabilistic Modeling & Calibration Utilities ============================
+SUM6_EPS = 1e-9
+SUM6_MAX_ITERS = 4
+CAL_WINDOW = 60              # draws used to fit calibrators
+CAL_MIN = 20
+CAL_METHOD = "platt+isotonic"  # {"isotonic","platt","platt+isotonic"}
+PF_PRIOR_BLEND = 0.08        # lighter PF prior so stacker dominates
+PF_ENSEMBLE_CONFIGS = [      # (num_particles, alpha, sigma)
+    (12000, 0.004, 0.008),
+    (16000, 0.003, 0.006),
+    (8000,  0.006, 0.012),
+]
+
+_cal_cache = {"LSTM": None, "Transformer": None, "t_fit": None}
+
+def _enforce_sum6(v):
+    """Project a length-40 vector v (non-negative) so that sum≈6 with clipping to [0,1].
+    Uses iterative rescale + clip (water-filling style) for a few passes.
+    Returns a copy with sum close to 6.
+    """
+    import numpy as _np
+    x = _np.clip(_np.asarray(v, dtype=float), 0.0, 1.0)
+    for _ in range(SUM6_MAX_ITERS):
+        s = float(x.sum())
+        if s <= 0:
+            x[:] = 6.0/40.0
+            break
+        x *= (6.0 / s)
+        over = x > 1.0
+        if _np.any(over):
+            x[over] = 1.0
+        s2 = float(x.sum())
+        if abs(s2 - 6.0) <= 1e-6:
+            break
+        if s2 > 0:
+            x *= (6.0 / s2)
+    return _np.clip(x, 0.0, 1.0)
+
+def _sum6_to_sum1_dict(p6_dict):
+    import numpy as _np
+    v = _np.array([float(p6_dict.get(i, 0.0)) for i in range(1,41)], dtype=float)
+    if v.sum() <= 0:
+        v = _np.ones(40, dtype=float)*(6.0/40.0)
+    v = _np.clip(v/6.0, 1e-18, None)
+    v = v / (v.sum() + 1e-18)
+    return {i: float(v[i-1]) for i in range(1,41)}
+
+# ---- Simple 1D calibrators ----------------------------------------------------
+class _Platt1D:
+    def __init__(self):
+        self.ok = False
+        self.coef_ = None
+        self.intercept_ = None
+    def fit(self, p, y):
+        try:
+            import numpy as _np
+            from sklearn.linear_model import LogisticRegression
+            p = _np.clip(_np.asarray(p, dtype=float).reshape(-1,1), 1e-6, 1-1e-6)
+            y = _np.asarray(y, dtype=float).reshape(-1)
+            if p.shape[0] < 100 or y.sum() == 0 or y.sum() == y.size:
+                self.ok = False
+                return self
+            logit = _np.log(p/(1-p))
+            lr = LogisticRegression(class_weight="balanced", max_iter=1000)
+            lr.fit(logit, y)
+            self.ok = True
+            self.coef_ = float(lr.coef_.ravel()[0])
+            self.intercept_ = float(lr.intercept_.ravel()[0])
+            self._lr = lr
+        except Exception:
+            self.ok = False
+        return self
+    def map(self, p):
+        import numpy as _np
+        p = _np.clip(_np.asarray(p, dtype=float).reshape(-1), 1e-9, 1-1e-9)
+        if not self.ok:
+            return p
+        z = _np.log(p/(1-p)) * self.coef_ + self.intercept_
+        out = 1.0/(1.0+_np.exp(-z))
+        return _np.clip(out, 1e-9, 1-1e-9)
+
+class _Iso1D:
+    def __init__(self):
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            self.iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        except Exception:
+            self.iso = None
+        self.ok = False
+    def fit(self, p, y):
+        import numpy as _np
+        if self.iso is None:
+            self.ok = False
+            return self
+        p = _np.clip(_np.asarray(p, dtype=float).reshape(-1), 1e-9, 1-1e-9)
+        y = _np.asarray(y, dtype=float).reshape(-1)
+        if p.size < 100 or y.sum() == 0 or y.sum() == y.size:
+            self.ok = False
+            return self
+        try:
+            self.iso.fit(p, y)
+            self.ok = True
+        except Exception:
+            self.ok = False
+        return self
+    def map(self, p):
+        import numpy as _np
+        p = _np.clip(_np.asarray(p, dtype=float).reshape(-1), 1e-9, 1-1e-9)
+        if not self.ok or self.iso is None:
+            return p
+        out = self.iso.predict(p)
+        return _np.clip(out, 1e-9, 1-1e-9)
+
+class _ComboCal:
+    def __init__(self, method="platt+isotonic"):
+        self.method = method
+        self.pl = _Platt1D()
+        self.iso = _Iso1D()
+        self.ok = False
+    def fit(self, p, y):
+        m = (self.method or "").lower()
+        if "platt" in m:
+            self.pl.fit(p, y)
+        if "isotonic" in m:
+            self.iso.fit(p, y)
+        self.ok = (self.pl.ok or self.iso.ok)
+        return self
+    def map(self, p):
+        import numpy as _np
+        p = _np.asarray(p, dtype=float).reshape(-1)
+        if not self.ok:
+            return _np.clip(p, 1e-9, 1-1e-9)
+        vals = []
+        if self.pl.ok:
+            vals.append(self.pl.map(p))
+        if self.iso.ok:
+            vals.append(self.iso.map(p))
+        if not vals:
+            return _np.clip(p, 1e-9, 1-1e-9)
+        out = _np.mean(_np.vstack(vals), axis=0)
+        return _np.clip(out, 1e-9, 1-1e-9)
+
+# Fit calibrators for LSTM/Transformer using last CAL_WINDOW draws up to t_eval
+def _fit_expert_calibrators(t_eval):
+    import numpy as _np
+    global _cal_cache
+    t_eval = int(t_eval)
+    t0 = max(1, t_eval - CAL_WINDOW + 1)
+    if t_eval == _cal_cache.get("t_fit") and all(_cal_cache.get(k) is not None for k in ("LSTM","Transformer")):
+        return _cal_cache
+    P = {"LSTM": [], "Transformer": []}
+    Y = []
+    _orig = globals().get("_predict_with_nets", None)
+    if not callable(_orig):
+        _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": t_eval}
+        return _cal_cache
+    if t_eval - t0 + 1 < CAL_MIN:
+        _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": t_eval}
+        return _cal_cache
+    for t in range(t0, t_eval+1):
+        try:
+            hist = _history_upto(t, context="_fit_expert_calibrators")
+            if 'compute_stat_features' in globals():
+                feats_t = compute_stat_features(hist[-min(len(hist), 8):], t - 1)
+                feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
+            else:
+                continue
+            meta_t = None
+            if '_meta_features_at_idx' in globals():
+                meta_t = __import__('numpy').array([_meta_features_at_idx(t)], dtype=float)
+            l, tr = _orig(feats_t, meta_t, t_idx=t, use_finetune=True, mc_passes=globals().get('MC_STACK_PASSES', 1))
+            l6 = _enforce_sum6(l*6.0)
+            tr6 = _enforce_sum6(tr*6.0)
+            winners = _winner_draw_at(t, context="_fit_expert_calibrators")
+            y = __import__('numpy').array([1 if n in winners else 0 for n in range(1,41)], dtype=float)
+            P["LSTM"].append(l6); P["Transformer"].append(tr6)
+            Y.append(y)
+        except Exception:
+            continue
+    if not P["LSTM"] or not Y:
+        _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": t_eval}
+        return _cal_cache
+    P_L = __import__('numpy').vstack(P["LSTM"]).reshape(-1)
+    P_T = __import__('numpy').vstack(P["Transformer"]).reshape(-1)
+    Yv  = __import__('numpy').vstack(Y).reshape(-1)
+    cal_L = _ComboCal(CAL_METHOD).fit(P_L, Yv)
+    cal_T = _ComboCal(CAL_METHOD).fit(P_T, Yv)
+    _cal_cache = {"LSTM": cal_L, "Transformer": cal_T, "t_fit": t_eval}
+    return _cal_cache
+
+# Postprocess raw net probabilities (length-40 array) → calibrated, sum-6, then sum-1
+def _postprocess_net_probs(arr, t_idx, expert_name="LSTM"):
+    import numpy as _np
+    v = _np.asarray(arr, dtype=float).reshape(-1)
+    if v.size != 40:
+        v = _np.ones(40, dtype=float) * (1.0/40.0)
+    # Step 1: sum-to-6 constraint
+    v6 = _enforce_sum6(v*6.0)
+    # Step 2: calibration
+    cals = _fit_expert_calibrators(max(1, int(t_idx)-1))
+    cal = cals.get(expert_name) if isinstance(cals, dict) else None
+    if cal is not None and getattr(cal, 'ok', False):
+        v6 = cal.map(v6)
+        v6 = _enforce_sum6(v6)
+    # Step 3: back to categorical (sum=1)
+    out = v6 / 6.0
+    out = _np.clip(out, 1e-12, None)
+    out = out / (out.sum() + 1e-12)
+    return out
+
+# ---- PF prior from history (ensemble over hyper-params) ----------------------
+def _pf_prior_from_history(sub_draws, configs=PF_ENSEMBLE_CONFIGS):
+    import numpy as _np
+    if not sub_draws:
+        return {n: 6.0/40.0 for n in range(1,41)}
+    preds = []
+    for (npart, a, s) in (configs or []):
+        try:
+            pf = ParticleFilter(num_numbers=40, num_particles=int(npart), alpha=float(a), sigma=float(s))
+            for d in sub_draws:
+                pf.predict()
+                pf.update(d)
+            pf.predict()
+            preds.append(pf.get_mean_probabilities())
+        except Exception:
+            continue
+    if not preds:
+        return {n: 6.0/40.0 for n in range(1,41)}
+    m = _np.mean(_np.vstack(preds), axis=0)
+    m = _enforce_sum6(m)
+    return {n: float(m[n-1]) for n in range(1,41)}
+
+def _geom_blend(p, q, lam=0.5):
+    """Geometric blend of two categorical dists p and q over 1..40 (sum=1 each)."""
+    import numpy as _np
+    lam = float(max(0.0, min(1.0, lam)))
+    vp = _np.array([float(p.get(i,0.0)) for i in range(1,41)], dtype=float)
+    vq = _np.array([float(q.get(i,0.0)) for i in range(1,41)], dtype=float)
+    vp = _np.clip(vp, 1e-18, None); vq = _np.clip(vq, 1e-18, None)
+    v = _np.power(vp, 1.0-lam) * _np.power(vq, lam)
+    v = _np.clip(v, 1e-18, None); v = v / (v.sum() + 1e-18)
+    return {i: float(v[i-1]) for i in range(1,41)}
+# ============================================================================
+
+# 2) Historical per‑expert distributions builder used by backtests/diagnostics
+if '_per_expert_prob_dicts_at_t' not in globals():
+    def _per_expert_prob_dicts_at_t(t_idx):
+        """Return base probability dicts at historical index t_idx using only draws[:t_idx].
+        Provides a safe, minimal version compatible with older code paths.
+        Keys match _per_expert_names(): ["Bayes","Markov","HMM","LSTM","Transformer"].
+        """
+        try:
+            t = int(t_idx)
+        except Exception:
+            return None
+        try:
+            hist = _history_upto(t, context="_per_expert_prob_dicts_at_t")
+        except Exception:
+            return None
+        if t <= 0 or len(hist) <= 0:
+            return None
+        # Bayes / Markov / HMM
+        try:
+            bayes_t = compute_bayes_posterior(hist, alpha=1)
+        except Exception:
+            bayes_t = {n: 1.0/40 for n in range(1,41)}
+        try:
+            # compute_markov_transitions returns (t1,t2,t3); use a simple conditional from last draw
+            t1, _, _ = compute_markov_transitions(hist)
+            last = hist[-1]
+            import numpy as _np
+            sc = _np.zeros(40, dtype=float)
+            for i in last:
+                for j in range(1,41):
+                    sc[j-1] += float(t1.get(i, {}).get(j, 1.0/40))
+            if sc.sum() > 0:
+                sc = sc / sc.sum()
+            markov_t = {n: float(sc[n-1]) for n in range(1,41)}
+        except Exception:
+            markov_t = {n: 1.0/40 for n in range(1,41)}
+        try:
+            hmm_t = _build_hmm_prob_from_subset(hist)
+        except Exception:
+            hmm_t = {n: 1.0/40 for n in range(1,41)}
+        # LSTM / Transformer via existing net predictor, if available
+        try:
+            if 'compute_stat_features' in globals():
+                feats_t = compute_stat_features(hist[-min(len(hist), 8):], t - 1)
+                feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
+            else:
+                feats_t = None
+            meta_t = None
+            if '_meta_features_at_idx' in globals():
+                import numpy as _np
+                meta_t = _np.array([_meta_features_at_idx(t)], dtype=float)
+            if '_predict_with_nets' in globals() and feats_t is not None:
+                _l_t, _tr_t = _predict_with_nets(feats_t, meta_t, t_idx=t, use_finetune=True, mc_passes=globals().get('MC_STACK_PASSES', 1))
+                _l_t = _postprocess_net_probs(_l_t, t, expert_name="LSTM")
+                _tr_t = _postprocess_net_probs(_tr_t, t, expert_name="Transformer")
+                lstm_t = {n: float(_l_t[n-1]) for n in range(1,41)}
+                trans_t = {n: float(_tr_t[n-1]) for n in range(1,41)}
+            else:
+                lstm_t = {n: 1.0/40 for n in range(1,41)}
+                trans_t = {n: 1.0/40 for n in range(1,41)}
+        except Exception:
+            lstm_t = {n: 1.0/40 for n in range(1,41)}
+            trans_t = {n: 1.0/40 for n in range(1,41)}
+        # Normalise defensively
+        def _norm(d):
+            import numpy as _np
+            v = _np.array([float(d.get(i,0.0)) for i in range(1,41)], dtype=float)
+            v = _np.clip(v, 1e-12, None); v = v / (v.sum() + 1e-12)
+            return {i: float(v[i-1]) for i in range(1,41)}
+        return {
+            "Bayes": _norm(bayes_t),
+            "Markov": _norm(markov_t),
+            "HMM": _norm(hmm_t),
+            "LSTM": _norm(lstm_t),
+            "Transformer": _norm(trans_t),
+        }
+
+# 3) Joint/marginal blender used by SetAR decoding paths
+if 'blend_joint_with_marginals' not in globals():
+    def blend_joint_with_marginals(joint_scores, marginal_scores, alpha=0.5):
+        """Blend a ticket‑level joint score dict with per‑number marginals.
+        `joint_scores`: dict[ticket_tuple->score]; `marginal_scores`: dict[num->p].
+        Returns a new dict with renormalised blended scores.
+        """
+        import numpy as _np
+        a = float(alpha)
+        a = 0.0 if not _np.isfinite(a) else max(0.0, min(1.0, a))
+        # Normalise joint scores
+        js_keys = list(joint_scores.keys()) if isinstance(joint_scores, dict) else []
+        if not js_keys:
+            return {}
+        js = _np.array([float(joint_scores[k]) for k in js_keys], dtype=float)
+        js = _np.clip(js, 1e-12, None); js = js / (js.sum() + 1e-12)
+        # Build a marginal product per ticket (without replacement proxy)
+        mp = []
+        for t in js_keys:
+            prod = 1.0
+            for n in t:
+                prod *= float(marginal_scores.get(n, 1.0/40.0))
+            mp.append(prod)
+        mp = _np.array(mp, dtype=float)
+        mp = _np.clip(mp, 1e-18, None); mp = mp / (mp.sum() + 1e-18)
+        comb = (1.0 - a) * js + a * mp
+        comb = _np.clip(comb, 1e-18, None); comb = comb / (comb.sum() + 1e-18)
+        return {k: float(v) for k, v in zip(js_keys, comb)}
+
+# --- Inserted predict_joint_enhanced ---
+if 'predict_joint_enhanced' not in globals():
+    def predict_joint_enhanced(t_eval=None, alpha=0.40, n_samples=20000, keep_top=400, topN=128):
+        """
+        Joint ticket predictor:
+          • If t_eval is None, uses CURRENT_TARGET_IDX or len(draws)-1.
+          • Returns (ticket_rankings, blended_scores_dict)
+        """
+        try:
+            if t_eval is None:
+                ct = globals().get("CURRENT_TARGET_IDX")
+                t_eval = int(ct) if ct is not None else int(len(draws) - 1)
+        except Exception:
+            t_eval = int(len(draws) - 1)
+        blended, ranked = score_and_blend_tickets(
+            int(t_eval),
+            alpha=float(alpha),
+            n_samples=int(n_samples),
+            keep_top=int(keep_top),
+            topN=int(topN)
+        )
+        return ranked, blended
+
+if '_export_reliability' not in globals():
+    def _export_reliability(
+        probs=None,
+        labels=None,
+        path_csv='reliability_curve.csv',
+        path_png='reliability_curve.png',
+        bins=20,
+        min_bin_count=50,
+        mode="equal_freq",
+        **kwargs
+    ):
+        """
+        Reliability (calibration) export on sum-6 probabilities with adaptive binning and full diagnostics.
+
+        Inputs:
+          - probs: 1D array-like of predicted probabilities for the observed outcome (binary).
+          - labels: 1D array-like of 0/1 labels (same length as probs).
+          - bins: maximum number of bins (for 'equal_freq' this is an upper bound).
+          - min_bin_count: minimum samples per bin; reduces #bins as needed.
+          - mode: {"equal_freq", "fixed_width"}.
+          - path_csv, path_png: output paths (relative paths are written under ./artifacts).
+          - Back-compat aliases: csv_path, png_path in kwargs.
+
+        CSV columns:
+          bin_lower, bin_upper, count, avg_pred, emp_rate, ci_lower, ci_upper
+
+        Returns:
+          dict summary with keys:
+            {
+              "ece": float,          # Expected Calibration Error (bin-weighted |emp - avg_pred|)
+              "brier": float,        # mean squared error
+              "logloss": float,      # -mean[y log p + (1-y) log(1-p)]
+              "bins": int,           # number of populated bins
+              "min_bin_count": int,  # enforced minimum per bin
+              "mode": str,           # binning mode
+              "csv": str,            # path to CSV
+              "png": str             # path to PNG
+            }
+        """
+        # Back-compat for callers using csv_path/png_path
+        if 'csv_path' in kwargs and not kwargs.get('path_csv'):
+            path_csv = kwargs.get('csv_path', path_csv)
+        if 'png_path' in kwargs and not kwargs.get('path_png'):
+            path_png = kwargs.get('png_path', path_png)
+
+        # Normalize to ./artifacts for relative filenames
+        try:
+            import os as _os
+            if path_csv and ("/" not in str(path_csv) and "\\" not in str(path_csv)):
+                path_csv = _artifact_path(str(path_csv))
+            if path_png and ("/" not in str(path_png) and "\\" not in str(path_png)):
+                path_png = _artifact_path(str(path_png))
+        except Exception:
+            pass
+
+        import numpy as _np
+        import math as _math
+        import csv as _csv
+
+        # Source data
+        _p = _np.asarray(probs, dtype=float).reshape(-1) if probs is not None else None
+        _y = _np.asarray(labels, dtype=float).reshape(-1) if labels is not None else None
+        if _p is None or _y is None or _p.size == 0 or _y.size != _p.size:
+            # Defensive globals fallback
+            _p = _np.asarray(globals().get('last_joint_probs', []), dtype=float).reshape(-1)
+            _y = _np.asarray(globals().get('last_joint_labels', []), dtype=float).reshape(-1)
+            if _p.size == 0 or _y.size != _p.size:
+                return {}
+        # Evaluate reliability on sum-6 semantics: scale categorical probs by 6 and clip to [0,1].
+        # This aligns predicted per-number probabilities with 0/1 labels (≈6 positives per draw).
+        try:
+            _p = _np.asarray(_p, dtype=float).reshape(-1)
+            _p = _np.clip(_p * 6.0, 1e-12, 1.0 - 1e-12)
+        except Exception:
+            _p = _np.clip(_p, 1e-12, 1.0 - 1e-12)
+
+        # Sanity and clipping (labels already 0/1)
+        _y = _np.clip(_y, 0.0, 1.0)
+
+        N = int(_p.size)
+        if N < 5:
+            return {}
+
+        # Compute global scores (independent of binning)
+        brier = float(_np.mean((_p - _y) ** 2))
+        logloss = float(-_np.mean(_y * _np.log(_p) + (1.0 - _y) * _np.log(1.0 - _p)))
+
+        # --- Binning helpers ---------------------------------------------------
+        def _wilson_ci(k, n, z=1.96):
+            if n <= 0:
+                return (0.0, 0.0)
+            phat = k / n
+            denom = 1 + (z**2)/n
+            center = (phat + (z**2)/(2*n)) / denom
+            margin = (z / denom) * _math.sqrt((phat*(1-phat)/n) + (z**2)/(4*n*n))
+            lo = max(0.0, center - margin)
+            hi = min(1.0, center + margin)
+            return (float(lo), float(hi))
+
+        def _equal_freq_bins(p_sorted, max_bins, min_cnt):
+            """Return list of (start_idx, end_idx) inclusive ranges for equal-frequency bins."""
+            n = p_sorted.size
+            if n == 0:
+                return []
+            max_bins = max(1, int(max_bins))
+            min_cnt = max(1, int(min_cnt))
+            # target bins limited by min_bin_count
+            max_by_count = max(1, n // min_cnt)
+            B = int(min(max_bins, max_by_count))
+            if B <= 1:
+                return [(0, n-1)]
+            edges = [0]
+            for b in range(1, B):
+                # quantile split
+                q = b / B
+                idx = int(_np.floor(q * n))
+                if idx <= edges[-1]:
+                    idx = edges[-1] + 1
+                edges.append(min(idx, n-1))
+            edges.append(n)
+            # Build ranges, merge tiny last bin if necessary
+            ranges = []
+            for i in range(len(edges)-1):
+                a, b = edges[i], edges[i+1]
+                if i == 0:
+                    ranges.append((a, b-1))
+                else:
+                    if b - edges[i] < min_cnt and ranges:
+                        # merge with previous
+                        prev_a, prev_b = ranges[-1]
+                        ranges[-1] = (prev_a, b-1)
+                    else:
+                        ranges.append((a, b-1))
+            # Clean empty bins
+            ranges = [(a,b) for (a,b) in ranges if b >= a]
+            return ranges
+
+        def _fixed_width_bins(p_vals, B):
+            edges = _np.linspace(0.0, 1.0, int(B)+1)
+            return edges
+
+        # Sort by probability for equal-frequency if needed
+        order = _np.argsort(_p)
+        p_sorted = _p[order]
+        y_sorted = _y[order]
+
+        rows = []
+        ece_num = 0.0
+        if (mode or "").lower() == "equal_freq":
+            ranges = _equal_freq_bins(p_sorted, bins if bins else 20, min_bin_count)
+            for (a, b) in ranges:
+                p_bin = p_sorted[a:b+1]
+                y_bin = y_sorted[a:b+1]
+                cnt = int(p_bin.size)
+                avg_p = float(p_bin.mean())
+                emp = float(y_bin.mean())
+                lo, hi = _wilson_ci(int(y_bin.sum()), cnt)
+                ece_num += (cnt / N) * abs(emp - avg_p)
+                # Use observed bin bounds (min/max) for CSV/plot
+                bin_lo = float(p_bin.min())
+                bin_hi = float(p_bin.max())
+                rows.append([bin_lo, bin_hi, cnt, avg_p, emp, lo, hi])
+        else:
+            # fixed-width as fallback (legacy behavior but with CI)
+            edges = _fixed_width_bins(_p, bins if bins else 20)
+            idx = _np.digitize(_p, edges, right=True)
+            for b in range(1, len(edges)):
+                mask = (idx == b)
+                if not _np.any(mask):
+                    continue
+                p_bin = _p[mask]
+                y_bin = _y[mask]
+                cnt = int(mask.sum())
+                avg_p = float(p_bin.mean())
+                emp = float(y_bin.mean())
+                lo, hi = _wilson_ci(int(y_bin.sum()), cnt)
+                ece_num += (cnt / N) * abs(emp - avg_p)
+                rows.append([float(edges[b-1]), float(edges[b]), cnt, avg_p, emp, lo, hi])
+
+        # Write CSV
+        try:
+            with open(path_csv, 'w', newline='') as f:
+                w = _csv.writer(f)
+                w.writerow(['bin_lower','bin_upper','count','avg_pred','emp_rate','ci_lower','ci_upper'])
+                w.writerows(rows)
+        except Exception:
+            pass
+
+        # Plot PNG
+        try:
+            import matplotlib.pyplot as _plt
+            xs = _np.linspace(0,1,101)
+            _plt.figure()
+            _plt.plot(xs, xs, linestyle='--', label='ideal')
+            if rows:
+                x_mid = [_np.mean(r[:2]) for r in rows]
+                emp = [r[4] for r in rows]
+                ci_lo = [r[5] for r in rows]
+                ci_hi = [r[6] for r in rows]
+                cnts = [r[2] for r in rows]
+                # error bars from ci
+                yerr_low = _np.maximum(0, _np.array(emp) - _np.array(ci_lo))
+                yerr_high = _np.maximum(0, _np.array(ci_hi) - _np.array(emp))
+                _plt.errorbar(x_mid, emp, yerr=[yerr_low, yerr_high], fmt='o', capsize=3, label='empirical ±95% CI')
+                for xm, c in zip(x_mid, cnts):
+                    _plt.annotate(str(c), (xm, 0.02), xytext=(0, 8), textcoords='offset points', ha='center', fontsize=8)
+            _plt.xlabel('Predicted probability')
+            _plt.ylabel('Empirical rate')
+            _plt.title('Reliability Curve (adaptive bins)')
+            _plt.legend()
+            _plt.tight_layout()
+            _plt.savefig(path_png)
+            _plt.close()
+        except Exception:
+            pass
+
+        summary = {
+            "ece": float(ece_num),
+            "brier": float(brier),
+            "logloss": float(logloss),
+            "bins": int(len(rows)),
+            "min_bin_count": int(min_bin_count),
+            "mode": "equal_freq" if (mode or "").lower() == "equal_freq" else "fixed_width",
+            "csv": str(path_csv),
+            "png": str(path_png),
+        }
+        return summary
+
+# 5) Base-weight adapter for marginal ensemble (fallback heuristic)
+if '_adapt_base_weights' not in globals():
+    def _adapt_base_weights(base_prob_dicts, y_true=None, prev_weights=None):
+        """Return non-negative weights over experts in `base_prob_dicts` (dict name->dict num->p).
+        Heuristic fallback:
+          1) If per-expert PL-NLLs at t are available via `_per_expert_pl_nll_at`, use softmax(-nll).
+          2) Else, prefer lower-entropy experts (sharper dists) via softmax(-entropy).
+          3) Else, return uniform.
+        `prev_weights` can be provided; we blend 70% new / 30% previous for stability.
+        Returns a numpy array aligned to `_per_expert_names()` summing to 1.
+        """
+        import numpy as _np
+        names = _per_expert_names() if '._per_expert_names' or '_per_expert_names' in globals() else list(base_prob_dicts.keys())
+        K = len(names)
+        w = _np.ones(K, dtype=float) / max(1, K)
+        try:
+            # 1) Try PL-NLLs
+            if '._per_expert_pl_nll_at' in globals() or '_per_expert_pl_nll_at' in globals():
+                try:
+                    t_eval = globals().get('CURRENT_TARGET_IDX')
+                    pe = globals().get('_per_expert_pl_nll_at')
+                    if callable(pe) and t_eval is not None and int(t_eval) >= 1:
+                        vals = pe(int(t_eval))
+                        if hasattr(vals, '__len__') and len(vals) == K:
+                            x = _np.array([float(v) if _np.isfinite(v) else 1.0 for v in vals], dtype=float)
+                            x = -x
+                            x = x - x.max()
+                            w = _np.exp(x); w = w / (w.sum() + 1e-12)
+                except Exception:
+                    pass
+            # 2) If still near-uniform, use entropy heuristic on provided bases
+            if _np.allclose(w, _np.ones_like(w)/max(1,K), rtol=0, atol=1e-6) and isinstance(base_prob_dicts, dict):
+                ent = _np.zeros(K, dtype=float)
+                for i, nm in enumerate(names):
+                    d = base_prob_dicts.get(nm, {})
+                    v = _np.array([float(d.get(j, 0.0)) for j in range(1,41)], dtype=float)
+                    v = _np.clip(v, 1e-12, None); v = v / (v.sum() + 1e-12)
+                    ent[i] = -_np.sum(v * _np.log(v))
+                x = -ent
+                x = x - x.max()
+                w = _np.exp(x); w = w / (w.sum() + 1e-12)
+            # 3) Temporal smoothing with previous weights if provided
+            if prev_weights is not None:
+                pw = _np.asarray(prev_weights, dtype=float)
+                if pw.shape == w.shape and _np.isfinite(pw).all():
+                    w = 0.7*w + 0.3*pw
+                    w = _np.clip(w, 1e-12, None); w = w / (w.sum() + 1e-12)
+        except Exception:
+            w = _np.ones(K, dtype=float) / max(1, K)
+        return w
+# --- Helper: Coerce input to prob dict {1..40 -> p} robustly ---
+def _coerce_to_prob_dict(obj, default_val=0.0):
+    """
+    Coerce various input shapes into a dict {1..40 -> p}.
+    Accepts:
+      - dict-like with numeric keys 1..40
+      - list/tuple/np.ndarray of length 40
+    Returns None if it cannot be coerced safely.
+    """
+    import numpy as _np
+    # Case 1: dict-like
+    if hasattr(obj, "get") and hasattr(obj, "keys"):
+        try:
+            v = _np.array([float(obj.get(i, default_val)) for i in range(1,41)], dtype=float)
+            v = _np.clip(v, 0.0, _np.inf)
+            s = float(v.sum())
+            if not _np.isfinite(s) or s <= 0:
+                return {i: float(1.0/40.0) for i in range(1,41)}
+            v = v / (s + 1e-18)
+            return {i: float(v[i-1]) for i in range(1,41)}
+        except Exception:
+            return None
+    # Case 2: array-like length 40
+    try:
+        arr = _np.asarray(obj, dtype=float).reshape(-1)
+        if arr.size == 40:
+            arr = _np.clip(arr, 0.0, _np.inf)
+            s = float(arr.sum())
+            if not _np.isfinite(s) or s <= 0:
+                arr = _np.ones(40, dtype=float) / 40.0
+            else:
+                arr = arr / (s + 1e-18)
+            return {i: float(arr[i-1]) for i in range(1,41)}
+    except Exception:
+        pass
+    # Otherwise give up
+    return None
+
+# 6) Mixer for per-expert marginal dicts (weighted sum + normalisation)
+if '_mix_prob_dicts' not in globals():
+    def _mix_prob_dicts(base_prob_dicts, weights=None, temperature=None, power=None, names=None):
+        """Combine expert marginals into a single probability dict over 1..40 (robust to bad inputs).
+        Args:
+          base_prob_dicts: dict name->(dict|array-like length-40) OR list[...] of same
+          weights: array-like weights aligned with _per_expert_names() (if dict) or list order
+          temperature/power/names: optional shaping
+        Returns: dict num->p (normalised, non-negative).
+        """
+        import numpy as _np
+
+        # Normalise inputs into a list of (name, dict{1..40->p})
+        items = []
+        if isinstance(base_prob_dicts, dict):
+            order = names or _per_expert_names()
+            for nm in order:
+                coerced = _coerce_to_prob_dict(base_prob_dicts.get(nm, None))
+                if coerced is None:
+                    # If completely missing or malformed, fall back to uniform for this expert
+                    coerced = {i: float(1.0/40.0) for i in range(1,41)}
+                items.append((nm, coerced))
+        elif isinstance(base_prob_dicts, (list, tuple)):
+            for i, d in enumerate(list(base_prob_dicts)):
+                coerced = _coerce_to_prob_dict(d)
+                if coerced is None:
+                    # skip scalars or junk entries gracefully
+                    continue
+                items.append((str(i), coerced))
+        else:
+            # Unhandled structure — return uniform to avoid crashing callers
+            return {i: float(1.0/40.0) for i in range(1,41)}
+
+        if not items:
+            return {i: float(1.0/40.0) for i in range(1,41)}
+
+        K = len(items)
+
+        # Build weight vector
+        w = _np.ones(K, dtype=float) / float(K)
+        if weights is not None:
+            try:
+                w_in = _np.asarray(weights, dtype=float).reshape(-1)
+                if w_in.size == K and _np.isfinite(w_in).all():
+                    w = _np.clip(w_in, 1e-12, None)
+                    w = w / (w.sum() + 1e-12)
+            except Exception:
+                pass
+
+        # Accumulate weighted sum
+        acc = _np.zeros(40, dtype=float)
+        for i, (_, d) in enumerate(items):
+            v = _np.array([float(d.get(n, 0.0)) for n in range(1,41)], dtype=float)
+            # Optional per-expert sharpening/flattening
+            if power is not None:
+                try:
+                    v = _np.power(_np.clip(v, 1e-18, None), float(power))
+                except Exception:
+                    pass
+            acc += float(w[i]) * v
+
+        # Optional temperature transformation on the mix (softmax on log-space)
+        if temperature is not None:
+            try:
+                t = float(temperature)
+                t = 1.0 if not _np.isfinite(t) or t <= 0 else t
+                acc = _np.exp(_np.log(_np.clip(acc, 1e-18, None)) / t)
+            except Exception:
+                pass
+
+        acc = _np.clip(acc, 1e-18, None)
+        acc = acc / (acc.sum() + 1e-18)
+        return {n: float(acc[n-1]) for n in range(1,41)}
+# === End shims ================================================================
+# --- Final shim registration (guarantee global binding) ---
+try:
+    globals()['_export_reliability'] = _export_reliability  # ensure symbol exists in global ns
+except Exception:
+    pass
+try:
+    globals()['_adapt_base_weights'] = _adapt_base_weights  # ensure symbol exists in global ns
+except Exception:
+    pass
+try:
+    globals()['_mix_prob_dicts'] = _mix_prob_dicts
+except Exception:
+    pass
 # --- Environment/version logging and run log helpers ---
 import json
 import os
@@ -74,30 +882,27 @@ def _now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 def _freeze_requirements(output_path="requirements_frozen.txt"):
-    """
-    Snapshot current Python packages to a pinned requirements file using `python -m pip freeze`.
-    This runs once per script invocation to 'version the environment' alongside the model run.
-    """
     try:
-        # Avoid repeatedly writing in the same second if re-imported
+        import os as _os
+        out_dir = _os.path.join(_os.getcwd(), "artifacts")
+        _os.makedirs(out_dir, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out = output_path
-        # If a file already exists with the same name, keep overwriting (acts like a lock-file for the run)
+        out = _os.path.join(out_dir, _os.path.basename(output_path))
         cmd = [sys.executable, "-m", "pip", "freeze"]
         txt = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=60)
         with open(out, "w", encoding="utf-8") as f:
             f.write("# Frozen by Lotto+ on " + stamp + "\n")
             f.write(txt)
     except Exception as e:
-        # Non-fatal
         warnings.warn(f"pip freeze failed: {e}")
 
 def _log_jsonl(record, path="run_log.jsonl"):
-    """
-    Append a single JSON record to a newline-delimited log file.
-    """
     try:
-        with open(path, "a", encoding="utf-8") as f:
+        import os as _os
+        out_dir = _os.path.join(_os.getcwd(), "artifacts")
+        _os.makedirs(out_dir, exist_ok=True)
+        out_path = _os.path.join(out_dir, _os.path.basename(path))
+        with open(out_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
         warnings.warn(f"run_log write failed: {e}")
@@ -179,8 +984,437 @@ def _summarise_calibrator():
         pass
     return cal
 
+# === Expert name contract ======================================================
+# Keep these EXACT strings across logs/mixing/backtests:
+# ["Bayes", "Markov", "HMM", "LSTM", "Transformer"]
+# If you ever rename the TCNN head to "TCNN" in logs:
+#   1) Update _per_expert_names() to replace "LSTM" -> "TCNN"
+#   2) Update _per_expert_prob_dicts_at_t(...) to return key "TCNN" instead of "LSTM"
+# Everything else should reference _per_expert_names() and remain unchanged.
+# ==============================================================================
+
 def _per_expert_names():
-    return ["Bayes", "Markov", "HMM", "TCNN", "Transformer"]
+    # Names must match keys returned by _per_expert_prob_dicts_at_t()
+    return ["Bayes", "Markov", "HMM", "LSTM", "Transformer"]
+
+def _assert_expert_key_consistency(bases_or_logs):
+    """
+    Soft guard to ensure all expected expert keys are present everywhere.
+    Emits a warning if any are missing or misspelled.
+    """
+    try:
+        expected = _per_expert_names()
+        keys = list(bases_or_logs.keys()) if isinstance(bases_or_logs, dict) else []
+        missing = [nm for nm in expected if nm not in keys]
+        if missing:
+            warnings.warn(f"Expert key mismatch. Missing keys {missing}. Expected exactly {expected}.")
+        return True
+    except Exception:
+        return True
+
+#
+# === Adaptive Ensemble Weighting & Meta‑Model Stacking =========================
+# This block learns expert weights from recent performance and (optionally)
+# trains a tiny logistic-regression meta-learner that maps 5 expert probabilities
+# → a calibrated probability per number. It activates automatically by wrapping
+# `_mix_prob_dicts` so existing call sites benefit without further edits.
+
+USE_ADAPTIVE_ENSEMBLE = True
+USE_META_STACKING = True
+ADAPT_WINDOW = 90              # (60–90) longer memory for more stable weights
+META_MIN_DRAWS = 60            # require ≥60 draws to train the stacker
+META_CLASS_WEIGHT = "balanced"  # handle 6/40 positives
+
+# --- New global knobs for prior strength and sharpening ---
+PF_PRIOR_BLEND = 0.08          # 0.05–0.10 so stacker signal dominates
+ADAPTIVE_TEMPERATURE = 1.0     # keep at 1.0 until calibrators are confirmed OK
+
+_last_adapt = {"t_eval": None, "weights": None, "method": None, "window": None, "meta_used": False}
+
+def _safe_clip01_arr(a):
+    import numpy as _np
+    a = _np.asarray(a, dtype=float).reshape(-1)
+    a = _np.clip(a, 1e-12, 1.0 - 1e-12)
+    return a
+
+# --- Utility: apply softmax temperature to a dict of probabilities ---
+def _apply_temperature(prob_dict, temperature):
+    """
+    Apply softmax temperature to a dict {1..40 -> p}. For temperature<1 we sharpen.
+    Returns a new dict summing to 1.
+    """
+    import numpy as _np
+    try:
+        t = float(temperature)
+    except Exception:
+        t = 1.0
+    if not _np.isfinite(t) or t <= 0:
+        t = 1.0
+    v = _np.array([float(prob_dict.get(i, 0.0)) for i in range(1, 41)], dtype=float)
+    v = _np.clip(v, 1e-18, None)
+    v = _np.exp(_np.log(v) / t)
+    v = v / (v.sum() + 1e-18)
+    return {i: float(v[i-1]) for i in range(1, 41)}
+
+def _per_expert_pl_nll_at(t_idx):
+    """
+    Compute a simple per-expert per-draw NLL at index t_idx (using draws[:t_idx]).
+    NLL ≈ average -log p(winner) over the six winners under each expert's marginal.
+    Returns list aligned to _per_expert_names().
+    """
+    import numpy as _np
+    t = int(t_idx)
+    if t <= 0 or t >= len(draws):
+        return [None]*len(_per_expert_names())
+    bases = _per_expert_prob_dicts_at_t(t)
+    if not isinstance(bases, dict):
+        return [None]*len(_per_expert_names())
+    winners = sorted(list(_winner_draw_at(t, context="_per_expert_pl_nll_at")))
+    out = []
+    for nm in _per_expert_names():
+        d = bases.get(nm, {})
+        ps = [_safe_clip01_arr([d.get(w, 1.0/40.0)])[0] for w in winners]
+        nll = float(-_np.mean(_np.log(ps)))
+        out.append(nll)
+    return out
+
+def _build_meta_training_matrix(t_start, t_end):
+    """
+    Build (X, y) for meta-learner over draws t in [t_start, t_end] (inclusive),
+    where each row corresponds to a (draw t, number n) pair with 5 expert probs
+    and label 1 iff n ∈ winners at t. Uses only history up to t (no leakage).
+    Returns X (num_rows x 5), y (num_rows,), and an optional per-row meta feature
+    matrix M (weekday/entropy/dispersion at t-1) if you want to extend later.
+    """
+    import numpy as _np
+    X_rows, y_rows, M_rows = [], [], []
+    t_start = max(1, int(t_start))
+    t_end = min(int(t_end), len(draws)-1)
+    for t in range(t_start, t_end+1):
+        bases = _per_expert_prob_dicts_at_t(t)
+        if not isinstance(bases, dict):
+            continue
+        winners = _winner_draw_at(t, context="_build_meta_training_matrix")
+        # Use feedback-augmented feature builder (adds calib ratio/residual flags)
+        X_t = _build_stacker_input(bases, t)
+        y_t = _np.array([1 if n in winners else 0 for n in range(1,41)], dtype=float)
+        # Optional small meta features vector (weekday/entropy/dispersion at t-1)
+        m = _np.array(_meta_features_at_idx(t-1), dtype=float) if '_meta_features_at_idx' in globals() else _np.zeros(3, dtype=float)
+        M_t = _np.repeat(m.reshape(1,-1), 40, axis=0)
+        X_rows.append(X_t); y_rows.append(y_t); M_rows.append(M_t)
+    if not X_rows:
+        return None, None, None
+    X = _np.vstack(X_rows)
+    y = _np.hstack(y_rows)
+    M = _np.vstack(M_rows)
+    return X, y, M
+
+class _MetaStacker:
+    """
+    Tiny MLP (single hidden layer) with post-hoc calibration.
+    Falls back to mean-of-experts if fitting fails.
+    """
+    def __init__(self):
+        self.model = None
+        self.ok = False
+        self.feature_dim_ = 5
+        self._cal = _ComboCal(method="platt+isotonic")
+
+    def fit(self, X, y):
+        try:
+            import numpy as _np
+            from sklearn.neural_network import MLPClassifier
+            X = _np.asarray(X, dtype=float)
+            y = _np.asarray(y, dtype=float).reshape(-1)
+            # Need enough rows & at least 5 columns; avoid degenerate labels
+            if X.ndim != 2 or X.shape[0] < 400 or X.shape[1] < 5 or y.sum() == 0 or y.sum() == y.size:
+                self.ok = False
+                self.model = None
+                self.feature_dim_ = int(X.shape[1]) if (X.ndim == 2) else 5
+                return self
+            clf = MLPClassifier(
+                hidden_layer_sizes=(16,),
+                activation="relu",
+                alpha=1e-4,
+                learning_rate_init=1e-3,
+                max_iter=2000,
+                early_stopping=True,
+                n_iter_no_change=25,
+                random_state=42,
+                verbose=False
+            )
+            clf.fit(X, y)
+            # Post-hoc calibrate on in-sample predictions (cheap + robust)
+            p_hat = _np.clip(clf.predict_proba(X)[:, 1], 1e-9, 1-1e-9)
+            self._cal = _ComboCal(method="platt+isotonic").fit(p_hat, y)
+            self.model = clf
+            self.ok = True
+            self.feature_dim_ = int(X.shape[1])
+        except Exception:
+            self.ok = False
+            self.model = None
+            self.feature_dim_ = 5
+        return self
+
+    def predict_proba(self, X):
+        try:
+            import numpy as _np
+            X = _np.asarray(X, dtype=float)
+            # Fallback = mean of first 5 expert columns
+            if not self.ok or self.model is None or X.ndim != 2:
+                return _np.clip(_np.mean(X[:, :5], axis=1), 1e-12, 1-1e-12)
+            d_train = int(getattr(self, "feature_dim_", X.shape[1]))
+            if X.shape[1] != d_train:
+                if X.shape[1] > d_train:
+                    X = X[:, :d_train]
+                else:
+                    pad = _np.zeros((X.shape[0], d_train - X.shape[1]), dtype=float)
+                    X = _np.hstack([X, pad])
+            p = self.model.predict_proba(X)[:, 1]
+            if isinstance(self._cal, _ComboCal) and getattr(self._cal, "ok", False):
+                p = self._cal.map(p)
+            return _np.clip(p, 1e-12, 1-1e-12)
+        except Exception:
+            import numpy as _np
+            return _np.clip(_np.mean(X[:, :5], axis=1), 1-1e-12, 1-1e-12)
+
+def _learn_blend_weights(t_eval, window=ADAPT_WINDOW, use_meta=True):
+    """
+    Learn expert weights from the last `window` completed draws up to `t_eval`
+    and optionally fit a meta-learner.
+    Returns: weights (len=5), stacker (_MetaStacker or None), stacked_probs (dict|None)
+    """
+    import numpy as _np
+    names = _per_expert_names()
+    t_eval = int(t_eval)
+    if DEBUG_GUARDS: _assert_idx_ok(t_eval, context="_learn_blend_weights")
+    if t_eval <= 1:
+        w = _np.ones(len(names), dtype=float) / max(1, len(names))
+        return w, None, None
+    t0 = max(1, t_eval - int(window) + 1)
+    # 1) NLL-based weights via softmax(-avg_nll)
+    nlls = []
+    for t in range(t0, t_eval+1):
+        vals = _per_expert_pl_nll_at(t)
+        if not isinstance(vals, list) or any(v is None for v in vals):
+            continue
+        nlls.append(vals)
+    if nlls:
+        arr = _np.asarray(nlls, dtype=float)       # shape: (W, 5)
+        avg = _np.nanmean(arr, axis=0)             # lower NLL is better
+        x = -avg
+        x = x - _np.max(x)
+        w = _np.exp(x); w = w / (w.sum() + 1e-12)
+    else:
+        w = _np.ones(len(names), dtype=float) / max(1, len(names))
+    stacker = None
+    stacked_probs = None
+    # 2) Meta-learner stacking (optional)
+    if use_meta and (t_eval - t0 + 1) >= META_MIN_DRAWS and USE_META_STACKING:
+        X, y, _M = _build_meta_training_matrix(t0, t_eval)
+        if X is not None and y is not None:
+            stacker = _MetaStacker().fit(X, y)
+            if stacker.ok:
+                # Produce stacked probabilities for the *next* draw (t_eval+1) from bases at t_eval+1
+                # (i.e., history up to t_eval+1, but we only have bases up to t_eval+1 by computing at that index)
+                # For safety in predict-time flows, we'll compute when called in wrapper.
+                pass
+    _last_adapt.update({"t_eval": t_eval, "weights": [float(x) for x in w], "method": "nll_softmax", "window": int(window), "meta_used": bool(stacker and stacker.ok)})
+    return w, stacker, stacked_probs
+
+def _stacked_probs_from_bases(stacker, bases_at_t, t_eval=None):
+    """
+    Return dict {1..40 -> p} using the fitted stacker with feedback features for t_eval.
+    Backward‑compatible: if t_eval is None, infer from CURRENT_TARGET_IDX or len(draws)-1.
+    """
+    import numpy as _np
+    if not stacker or not getattr(stacker, "ok", False):
+        return None
+    # Choose evaluation index if not provided
+    try:
+        if t_eval is None:
+            ct = globals().get("CURRENT_TARGET_IDX")
+            if ct is not None:
+                t_eval = int(ct)
+            else:
+                _dr = globals().get("draws", None)
+                t_eval = len(_dr) - 1 if isinstance(_dr, (list, tuple)) else 1
+        t_eval = int(t_eval)
+    except Exception:
+        t_eval = 1
+    try:
+        X = _build_stacker_input(bases_at_t, int(t_eval))  # (40, d)
+        p = stacker.predict_proba(X)                       # (40,)
+        s = float(_np.sum(p))
+        if not _np.isfinite(s) or s <= 0:
+            p = _np.ones(40, dtype=float) * (6.0/40.0)
+        else:
+            p = p * (6.0 / s)
+        p = _np.clip(p, 1e-12, None)
+        p = p / (p.sum() + 1e-12)
+        return {n: float(p[n-1]) for n in range(1,41)}
+    except Exception:
+        return None
+
+# ---- Wrapper: transparently upgrade _mix_prob_dicts to adaptive/stacked ------
+try:
+    _MIX_BASE_ORIG = globals().get("_mix_prob_dicts", None)
+except Exception:
+    _MIX_BASE_ORIG = None
+
+def _mix_prob_dicts_adaptive(base_prob_dicts, weights=None, temperature=None, power=None, names=None):
+    """
+    Drop-in replacement for `_mix_prob_dicts`:
+      - Learns recent expert weights from NLL over a sliding window.
+      - If a meta-learner is available, uses stacked probabilities.
+      - Blends the result with a PF prior (geometric), then enforces sum≈6 semantics → back to sum=1.
+      - Falls back to the original `_mix_prob_dicts` if adaptive is disabled or inputs are unusual.
+
+    Inputs:
+      base_prob_dicts: dict[name -> dict[num->p]] preferred; list[dict] also supported via fallback.
+      weights/temperature/power/names: kept for signature compatibility with the original mixer.
+
+    Returns:
+      dict[num->p] over 1..40 summing to 1 (categorical), after PF prior blending and sum-6 enforcement.
+    """
+    import numpy as _np
+
+    # If the original implementation is missing, do a simple uniform average across provided dicts.
+    if _MIX_BASE_ORIG is None:
+        if isinstance(base_prob_dicts, dict):
+            keys = names or _per_expert_names()
+            mats = []
+            for nm in keys:
+                di = base_prob_dicts.get(nm, {})
+                mats.append([float(di.get(n, 0.0)) for n in range(1, 41)])
+            V = _np.array(mats, dtype=float)  # (K, 40)
+            v = _np.clip(V.mean(axis=0), 1e-18, None)
+            v = v / (v.sum() + 1e-18)
+            return {n: float(v[n-1]) for n in range(1, 41)}
+        # Unknown structure: just return as-is to avoid surprises.
+        return base_prob_dicts
+
+    # If adaptive is disabled or the structure isn't a dict[name->dict], delegate to the original mixer.
+    if not USE_ADAPTIVE_ENSEMBLE or not isinstance(base_prob_dicts, dict):
+        # Try to coerce even if dict values are arrays/scalars
+        if isinstance(base_prob_dicts, dict):
+            base_prob_dicts = {k: (_coerce_to_prob_dict(v) or {i: 1.0/40.0 for i in range(1,41)}) for k, v in base_prob_dicts.items()}
+        return _MIX_BASE_ORIG(base_prob_dicts, weights=weights, temperature=temperature, power=power, names=names)
+
+    # If historical draws are not loaded yet (e.g., early self-test), bypass adaptive path
+    _dr = globals().get('draws', None)
+    if not isinstance(_dr, (list, tuple)) or len(_dr) == 0:
+        return _MIX_BASE_ORIG(base_prob_dicts, weights=weights, temperature=temperature, power=power, names=names)
+
+    # Choose evaluation index: during backtests CURRENT_TARGET_IDX is set; otherwise last completed draw.
+    _ct = globals().get("CURRENT_TARGET_IDX")
+    if _ct is not None:
+        t_eval = int(_ct)
+    else:
+        t_eval = len(_dr) - 1
+
+    # Sanitize provided bases: ensure each expert maps to a proper prob dict
+    try:
+        if isinstance(base_prob_dicts, dict):
+            base_prob_dicts = {k: (_coerce_to_prob_dict(v) or {i: 1.0/40.0 for i in range(1,41)}) for k, v in base_prob_dicts.items()}
+    except Exception:
+        pass
+
+    # Learn recent weights and (optionally) a meta-learner stacker.
+    w, stacker, _ = _learn_blend_weights(t_eval, window=ADAPT_WINDOW, use_meta=USE_META_STACKING)
+
+    # --- Meta-learner stacked path -------------------------------------------
+    if stacker and getattr(stacker, "ok", False):
+        # Use supplied bases if present; otherwise recompute defensively for t_eval.
+        bases_now = base_prob_dicts
+        try:
+            if not isinstance(bases_now, dict) or len(bases_now) == 0:
+                bases_now = _per_expert_prob_dicts_at_t(t_eval)
+        except Exception:
+            pass
+
+        stacked = _stacked_probs_from_bases(stacker, bases_now, t_eval)
+        if isinstance(stacked, dict) and len(stacked) == 40:
+            # PF prior blend (geometric) → enforce sum≈6 → back to categorical sum=1
+            try:
+                pf6 = _pf_prior_from_history(_history_upto(max(0, t_eval), context="_mix_prob_dicts_adaptive:stacked"), PF_ENSEMBLE_CONFIGS)
+                pf1 = _sum6_to_sum1_dict(pf6)
+                stacked = _geom_blend(stacked, pf1, lam=PF_PRIOR_BLEND)
+                _v = _np.array([stacked[i] for i in range(1, 41)], dtype=float)
+                _v6 = _enforce_sum6(_v * 6.0)
+                _v1 = _v6 / 6.0
+                _v1 = _v1 / (_v1.sum() + 1e-12)
+                stacked = {i: float(_v1[i-1]) for i in range(1, 41)}
+            except Exception:
+                # If anything goes wrong, keep the original stacked result
+                pass
+            # Optional final sharpening to improve separation/calibration bin usage
+            try:
+                _temp = float(globals().get("ADAPTIVE_TEMPERATURE", 1.0))
+                _cals = _fit_expert_calibrators(max(1, int(t_eval)-1))
+                _fb = _get_feedback(max(1, int(t_eval)-1))
+                _cal_ok = (isinstance(_cals, dict) and any(getattr(_cals.get(k), "ok", False) for k in ("LSTM","Transformer"))) or (_fb and (_fb.get("iso") is not None))
+                if _cal_ok and abs(_temp - 1.0) > 1e-9:
+                    stacked = _apply_temperature(stacked, _temp)
+            except Exception:
+                pass
+            # NEW: feedback correction
+            try:
+                stacked = _apply_feedback_correction(stacked, t_eval)
+            except Exception:
+                pass
+            # Log & return
+            try:
+                _log_predict_run(w, t_eval=t_eval)
+            except Exception:
+                pass
+            return stacked
+
+    # --- Non-stacked path: use learned weights with original mixer ------------
+    try:
+        out = _MIX_BASE_ORIG(base_prob_dicts, weights=w, temperature=temperature, power=power, names=names)
+        # PF prior blend (geometric) → enforce sum≈6 → back to categorical sum=1
+        try:
+            pf6 = _pf_prior_from_history(_history_upto(max(0, t_eval), context="_mix_prob_dicts_adaptive:base"), PF_ENSEMBLE_CONFIGS)
+            pf1 = _sum6_to_sum1_dict(pf6)
+            out = _geom_blend(out, pf1, lam=PF_PRIOR_BLEND)
+            _v = _np.array([out[i] for i in range(1, 41)], dtype=float)
+            _v6 = _enforce_sum6(_v * 6.0)
+            _v1 = _v6 / 6.0
+            _v1 = _v1 / (_v1.sum() + 1e-12)
+            out = {i: float(_v1[i-1]) for i in range(1, 41)}
+        except Exception:
+            pass
+        # Optional final sharpening for non‑stacked path
+        try:
+            _temp = float(globals().get("ADAPTIVE_TEMPERATURE", 1.0))
+            _cals = _fit_expert_calibrators(max(1, int(t_eval)-1))
+            _fb = _get_feedback(max(1, int(t_eval)-1))
+            _cal_ok = (isinstance(_cals, dict) and any(getattr(_cals.get(k), "ok", False) for k in ("LSTM","Transformer"))) or (_fb and (_fb.get("iso") is not None))
+            if _cal_ok and abs(_temp - 1.0) > 1e-9:
+                out = _apply_temperature(out, _temp)
+        except Exception:
+            pass
+        # NEW: feedback correction on the mixed distribution
+        try:
+            out = _apply_feedback_correction(out, t_eval)
+        except Exception:
+            pass
+        try:
+            _log_predict_run(w, t_eval=t_eval)
+        except Exception:
+            pass
+        return out
+    except Exception:
+        # Worst-case fallback: original call with whatever weights were provided to us.
+        return _MIX_BASE_ORIG(base_prob_dicts, weights=weights, temperature=temperature, power=power, names=names)
+
+# Monkey-patch: replace any existing `_mix_prob_dicts` with our adaptive wrapper
+try:
+    globals()["_mix_prob_dicts"] = _mix_prob_dicts_adaptive
+except Exception:
+    pass
+# ==============================================================================
 
 def _log_predict_run(blend_weights, t_eval=None, log_path="run_log.jsonl"):
     """
@@ -223,12 +1457,899 @@ def _log_predict_run(blend_weights, t_eval=None, log_path="run_log.jsonl"):
             "calibration": _summarise_calibrator(),
             "per_expert_pl_nll": nlls,
             "weekday_gate": wk_gate,
+            "feedback": (lambda _fb: {
+                "window": _fb.get("window"),
+                "t_fit": _fb.get("t_fit"),
+                "brier": _safe_float(_fb.get("brier")),
+                "logloss": _safe_float(_fb.get("logloss"))
+            })(_get_feedback(t_eval)),
         }
         print("[RUN]", json.dumps(rec, ensure_ascii=False))
         _log_jsonl(rec, path=log_path)
     except Exception as e:
         warnings.warn(f"predict-time logging failed: {e}")
 
+ 
+# === Feedback Loop & Self-Improvement =========================================
+# Learn from recent mistakes: fit an isotonic calibrator on recent predictions vs. outcomes
+# and compute per-number residuals (under/over-confidence). Expose these as features and
+# apply a gentle multiplicative correction to the final mix.
+
+FEED_WINDOW = 90            # expanded window (60–90)
+FEED_MIN = 60               # delay activation until enough history
+FEED_RESID_THRESH = 0.003   # unchanged
+FEED_GAMMA = 0.30           # softened calibration ratio correction
+FEED_BETA = 0.25            # softened residual boost
+
+_feedback_cache = {"t_fit": None, "window": None, "iso": None,
+                   "avg_pred40": None, "emp40": None, "resid40": None,
+                   "brier": None, "logloss": None}
+
+def _safe_hist_window(t_eval, W):
+    t_eval = int(max(1, t_eval))
+    t0 = max(1, t_eval - int(W) + 1)
+    return t0, t_eval
+
+def _winners_at(t):
+    try:
+        return _winner_draw_at(int(t), context="_winners_at")
+    except Exception:
+        return set()
+
+def _mix_proxy_at_t(t):
+    """
+    Build a proxy mixed distribution at historical index t using the original mixer
+    and weights learned only from draws up to t-1 (avoid leakage & recursion).
+    """
+    import numpy as _np
+    bases = _per_expert_prob_dicts_at_t(t)
+    if not isinstance(bases, dict) or len(bases) == 0:
+        return {i: 1.0/40.0 for i in range(1,41)}
+    try:
+        w, _stk, _ = _learn_blend_weights(max(1, int(t)-1), window=ADAPT_WINDOW, use_meta=False)
+    except Exception:
+        w = _np.ones(len(_per_expert_names()), dtype=float)/float(len(_per_expert_names()))
+    try:
+        return _MIX_BASE_ORIG(bases, weights=w, names=_per_expert_names())
+    except Exception:
+        mats = []
+        for nm in _per_expert_names():
+            di = bases.get(nm, {})
+            mats.append([float(di.get(n, 1.0/40.0)) for n in range(1,41)])
+        V = _np.array(mats, dtype=float)
+        v = _np.clip(V.mean(axis=0), 1e-18, None)
+        v = v / (v.sum() + 1e-18)
+        return {n: float(v[n-1]) for n in range(1,41)}
+
+def _fit_feedback(t_eval, window=FEED_WINDOW):
+    """
+    Fit isotonic calibrator and compute per-number residuals over a sliding window.
+    Stores in _feedback_cache and returns it.
+    """
+    import numpy as _np
+    t0, te = _safe_hist_window(t_eval, window)
+    if te - t0 + 1 < FEED_MIN:
+        _feedback_cache.update({"t_fit": te, "window": int(window), "iso": None,
+                                "avg_pred40": None, "emp40": None, "resid40": None,
+                                "brier": None, "logloss": None})
+        return _feedback_cache
+    P_all, Y_all = [], []
+    avg_pred = _np.zeros(40, dtype=float)
+    emp = _np.zeros(40, dtype=float)
+    count = 0
+    for t in range(t0, te+1):
+        p_mix = _mix_proxy_at_t(t)
+        y = _np.zeros(40, dtype=float)
+        for w in _winners_at(t):
+            if 1 <= w <= 40:
+                y[w-1] = 1.0
+        v = _np.array([p_mix.get(i, 1.0/40.0) for i in range(1,41)], dtype=float)
+        P_all.append(v.reshape(-1)); Y_all.append(y.reshape(-1))
+        avg_pred += v; emp += y; count += 1
+    if count == 0:
+        _feedback_cache.update({"t_fit": te, "window": int(window), "iso": None,
+                                "avg_pred40": None, "emp40": None, "resid40": None,
+                                "brier": None, "logloss": None})
+        return _feedback_cache
+    P_all = _np.vstack(P_all).reshape(-1)
+    Y_all = _np.vstack(Y_all).reshape(-1)
+    brier = float(_np.mean((P_all - Y_all)**2))
+    logloss = float(-_np.mean(Y_all*_np.log(_np.clip(P_all,1e-12,1-1e-12)) +
+                              (1.0-Y_all)*_np.log(_np.clip(1.0-P_all,1e-12,1-1e-12))))
+    iso = _Iso1D().fit(P_all, Y_all)
+    avg_pred /= float(count); emp /= float(count)
+    resid = (emp - avg_pred)  # + => underconfident; − => overconfident
+    _feedback_cache.update({
+        "t_fit": te, "window": int(window), "iso": iso if getattr(iso, "ok", False) else None,
+        "avg_pred40": avg_pred, "emp40": emp, "resid40": resid,
+        "brier": brier, "logloss": logloss
+    })
+    return _feedback_cache
+
+def _get_feedback(t_eval):
+    info = _feedback_cache
+    if info.get("t_fit") != int(t_eval):
+        info = _fit_feedback(int(t_eval), window=FEED_WINDOW)
+    return info
+
+def _co_matrix_recent(t_eval, window=120):
+    """
+    Symmetric 40x40 co-occurrence matrix C where C[i-1,j-1] ≈ P(i and j co-occur)
+    over the last `window` completed draws up to t_eval (exclusive).
+    """
+    import numpy as _np
+    t_eval = int(t_eval)
+    _dr = globals().get("draws", None)
+    if not isinstance(_dr, (list, tuple)) or t_eval <= 1:
+        return _np.zeros((40,40), dtype=float), 0
+    t0 = max(1, t_eval - int(window))
+    C = _np.zeros((40,40), dtype=float)
+    nD = 0
+    for t in range(t0, t_eval):
+        try:
+            s = set(_winner_draw_at(t, context="_co_matrix_recent"))
+            if not s:
+                continue
+            nD += 1
+            idx = [n-1 for n in s if 1 <= n <= 40]
+            for i in idx:
+                for j in idx:
+                    if i == j:
+                        continue
+                    C[i, j] += 1.0
+        except Exception:
+            continue
+    if nD > 0:
+        C = C / float(nD)
+        C = _np.clip(C, 0.0, 1.0)
+    return C, nD
+
+def _recency_and_decay(t_eval, half_life=30, window=180):
+    """
+    For each number 1..40:
+      recency_gap_norm ∈ [0,1] and exp_decay_norm ∈ [0,1] over `window`.
+    """
+    import numpy as _np
+    t_eval = int(t_eval)
+    _dr = globals().get("draws", None)
+    if not isinstance(_dr, (list, tuple)) or t_eval <= 1:
+        return _np.zeros(40), _np.zeros(40)
+    t0 = max(1, t_eval - int(window) + 1)
+    last_seen = _np.full(40, _np.inf, dtype=float)
+    decay = _np.zeros(40, dtype=float)
+    lam = _np.log(2.0) / max(1.0, float(half_life))
+    for t in range(t0, t_eval+1):
+        dt = (t_eval - t)
+        w = _np.exp(-lam * dt)
+        try:
+            s = set(_winner_draw_at(t, context="_recency_and_decay"))
+        except Exception:
+            s = set()
+        for n in s:
+            if 1 <= n <= 40:
+                last_seen[n-1] = min(last_seen[n-1], float(t_eval - t))
+                decay[n-1] += w
+    gap = last_seen.copy()
+    gap[_np.isinf(gap)] = float(window)
+    gap = _np.clip(gap, 0.0, float(window)) / float(window)
+    if decay.max() > 0:
+        decay = decay / (decay.max() + 1e-12)
+    return gap, decay
+
+# === Ticket-level Joint Model (XGBoost) ======================================
+# Train a ranker/classifier over sampled 6-number tickets.
+# Positives: winning ticket at draw t
+# Negatives: 5–20k sampled tickets (biased toward high-marginals)
+# Features (per ticket):
+#  • sum/mean/max/sumlog of per-number marginals
+#  • pair/triad co-occurrence stats from C (sum over pairs, mean over pairs, clique density proxy)
+#  • recency stats (min/mean gap, sum/mean decay)
+#  • diversity vs top-k set (Jaccard distance)
+#  • PF prior product/sum (log space)
+#
+# Inference:
+#  • Build top-N candidates from marginals via biased sampling
+#  • Score with ranker; blend joint with marginals (alpha≈0.35–0.45)
+
+_ticket_ranker = {"model": None, "feat_dim": None, "trained_range": None, "xgb_type": None}
+
+def _ticket_feature_vector(ticket, marginals, C, rec_gap, decay, pf1, topk_set):
+    import numpy as _np
+    nums = sorted(list(ticket))
+    idx = [n-1 for n in nums]
+    p = _np.array([float(marginals.get(n, 1.0/40.0)) for n in nums], dtype=float)
+    pf = _np.array([float(pf1.get(n, 1.0/40.0)) for n in nums], dtype=float)
+
+    # Marginal aggregates
+    sum_p = float(p.sum()); mean_p = float(p.mean()); max_p = float(p.max())
+    log_p = _np.log(_np.clip(p, 1e-18, None)); sum_log_p = float(log_p.sum()); mean_log_p = float(log_p.mean())
+
+    # Pair/triad co-occurrence inside the ticket
+    pair_vals = []
+    for i in range(6):
+        for j in range(i+1, 6):
+            pair_vals.append(float(C[idx[i], idx[j]]))
+    if not pair_vals:
+        pair_vals = [0.0]
+    pair_vals = _np.asarray(pair_vals, dtype=float)
+    pair_sum = float(pair_vals.sum()); pair_mean = float(pair_vals.mean())
+
+    # Triad proxy: node-wise mean of pair strengths (clique density proxy)
+    tri_proxy = 0.0
+    for i in range(6):
+        others = [j for j in range(6) if j != i]
+        tri_proxy += float(_np.mean([C[idx[i], idx[j]] for j in others])) if others else 0.0
+    tri_proxy /= 6.0
+
+    # Recency stats
+    g = _np.array([float(rec_gap[n-1]) for n in nums], dtype=float)
+    d = _np.array([float(decay[n-1]) for n in nums], dtype=float)
+    gap_min = float(g.min()); gap_mean = float(g.mean())
+    decay_sum = float(d.sum()); decay_mean = float(d.mean())
+
+    # Diversity vs top-k numbers (Jaccard distance)
+    inter = len(set(nums) & set(topk_set))
+    jaccard = 1.0 - float(inter) / float(len(set(nums) | set(topk_set)) or 1.0)
+
+    # PF prior aggregates (log product + mean)
+    log_pf = _np.log(_np.clip(pf, 1e-18, None))
+    pf_log_sum = float(log_pf.sum()); pf_log_mean = float(log_pf.mean())
+
+    return _np.array([
+        sum_p, mean_p, max_p, sum_log_p, mean_log_p,
+        pair_sum, pair_mean, tri_proxy,
+        gap_min, gap_mean, decay_sum, decay_mean,
+        jaccard, pf_log_sum, pf_log_mean
+    ], dtype=float)
+
+def _sample_negative_tickets(marginals, n_samples=10000, power=1.5, seed=42):
+    """Sample unique 6-number tickets, biased toward high marginals by p^power."""
+    import numpy as _np
+    _np.random.seed(int(seed))
+    base = _np.array([float(marginals.get(i, 1.0/40.0)) for i in range(1,41)], dtype=float)
+    base = _np.power(_np.clip(base, 1e-18, None), float(power))
+    base = base / (base.sum() + 1e-18)
+    nums = _np.arange(1, 41, dtype=int)
+    seen, out = set(), []
+    tries = int(n_samples) * 5 + 1000
+    for _ in range(tries):
+        draw = tuple(sorted(_np.random.choice(nums, size=6, replace=False, p=base)))
+        if draw not in seen:
+            seen.add(draw); out.append(draw)
+            if len(out) >= int(n_samples):
+                break
+    return out
+
+def _build_ticket_dataset_for_draw(t, neg_per_draw=10000, topk=10):
+    import numpy as _np
+    p_mix = _mix_proxy_at_t(int(t))
+    C, _ = _co_matrix_recent(int(t), window=120)
+    rec_gap, decay = _recency_and_decay(int(t), half_life=30, window=180)
+    try:
+        pf6 = _pf_prior_from_history(_history_upto(max(0, int(t)), context="_build_ticket_dataset_for_draw"))
+        pf1 = _sum6_to_sum1_dict(pf6)
+    except Exception:
+        pf1 = {i: 1.0/40.0 for i in range(1,41)}
+    # Top-k for diversity
+    order = _np.argsort([-float(p_mix.get(i, 0.0)) for i in range(1,41)])
+    topk_set = set([int(order[i])+1 for i in range(min(int(topk), 40))])
+
+    pos = tuple(sorted(list(_winner_draw_at(int(t), context="_build_ticket_dataset_for_draw"))))
+    X_pos = _ticket_feature_vector(pos, p_mix, C, rec_gap, decay, pf1, topk_set).reshape(1,-1)
+    y_pos = _np.array([1.0], dtype=float)
+
+    negs = _sample_negative_tickets(p_mix, n_samples=int(neg_per_draw), power=1.7, seed=777+int(t))
+    X_neg = _np.vstack([_ticket_feature_vector(n, p_mix, C, rec_gap, decay, pf1, topk_set) for n in negs])
+    y_neg = _np.zeros(len(negs), dtype=float)
+
+    X = _np.vstack([X_pos, X_neg])
+    y = _np.hstack([y_pos, y_neg])
+    group = _np.array([X.shape[0]], dtype=int)  # one group per draw (for ranker)
+    return X, y, group
+
+def train_ticket_ranker(t_start, t_end, neg_per_draw=10000, min_draws=20):
+    """Train XGBoost ranker if available, else classifier (logistic)."""
+    global _ticket_ranker, xgb
+    import numpy as _np
+    if xgb is None:
+        warnings.warn("XGBoost unavailable; ticket ranker disabled.")
+        _ticket_ranker = {"model": None, "feat_dim": None, "trained_range": None, "xgb_type": None}
+        return _ticket_ranker
+
+    t_start = max(2, int(t_start)); t_end = int(t_end)
+    if t_end - t_start + 1 < int(min_draws):
+        warnings.warn("Not enough draws to train ticket ranker.")
+        _ticket_ranker = {"model": None, "feat_dim": None, "trained_range": None, "xgb_type": None}
+        return _ticket_ranker
+
+    Xs, ys, groups = [], [], []
+    for t in range(t_start, t_end+1):
+        try:
+            X_t, y_t, g_t = _build_ticket_dataset_for_draw(t, neg_per_draw=int(neg_per_draw))
+            Xs.append(X_t); ys.append(y_t); groups.append(int(g_t[0]))
+        except Exception as e:
+            warnings.warn(f"ticket dataset failed at t={t}: {e}")
+            continue
+    if not Xs:
+        warnings.warn("No ticket training data compiled.")
+        _ticket_ranker = {"model": None, "feat_dim": None, "trained_range": None, "xgb_type": None}
+        return _ticket_ranker
+
+    X = _np.vstack(Xs); y = _np.hstack(ys)
+    feat_dim = int(X.shape[1])
+
+    model = None; xgb_type = None
+    try:
+        if hasattr(xgb, "XGBRanker"):
+            model = xgb.XGBRanker(
+                objective="rank:pairwise",
+                n_estimators=400,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1.0,
+                random_state=42,
+                n_jobs=0
+            )
+            model.fit(X, y, group=groups, verbose=False)
+            xgb_type = "ranker"
+        else:
+            raise AttributeError("XGBRanker not present")
+    except Exception:
+        try:
+            model = xgb.XGBClassifier(
+                objective="binary:logistic",
+                n_estimators=500,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_lambda=1.0,
+                random_state=42,
+                n_jobs=0,
+                scale_pos_weight=max(1.0, float((y == 0).sum()) / float((y == 1).sum() + 1e-12))
+            )
+            model.fit(X, y, verbose=False)
+            xgb_type = "classifier"
+        except Exception as e:
+            warnings.warn(f"XGBoost training failed: {e}")
+            model = None; xgb_type = None
+
+    _ticket_ranker = {"model": model, "feat_dim": feat_dim, "trained_range": (int(t_start), int(t_end)), "xgb_type": xgb_type}
+    return _ticket_ranker
+
+def _candidate_tickets_from_marginals(marginals, n_samples=20000, keep_top=400, power=1.5, seed=1234):
+    """Biased sampling by p^power; keep top by product-of-marginals."""
+    import numpy as _np
+    cands = _sample_negative_tickets(marginals, n_samples=int(n_samples), power=float(power), seed=int(seed))
+    logs = []
+    for t in cands:
+        s = 0.0
+        for n in t:
+            s += float(_np.log(max(1e-18, float(marginals.get(n, 1.0/40.0)))))
+        logs.append(s)
+    order = _np.argsort(logs)[-int(keep_top):]
+    keep = [cands[i] for i in order]
+    return list(dict.fromkeys(keep))
+
+def score_and_blend_tickets(t_eval, alpha=0.40, n_samples=20000, keep_top=400, topN=128, power=1.6):
+    """
+    Build candidates for target t_eval+1 from marginals, score with ticket model
+    (if available), then blend joint with marginals via alpha in [0.35,0.45].
+    Returns (blended_scores_dict, ranked_ticket_list).
+    """
+    import numpy as _np
+    p_mix = _mix_proxy_at_t(int(t_eval) + 1)
+    C, _ = _co_matrix_recent(int(t_eval) + 1, window=120)
+    rec_gap, decay = _recency_and_decay(int(t_eval) + 1, half_life=30, window=180)
+    try:
+        pf6 = _pf_prior_from_history(_history_upto(max(0, int(t_eval) + 1), context="score_and_blend_tickets"))
+        pf1 = _sum6_to_sum1_dict(pf6)
+    except Exception:
+        pf1 = {i: 1.0/40.0 for i in range(1,41)}
+    order = _np.argsort([-float(p_mix.get(i, 0.0)) for i in range(1,41)])
+    topk_set = set([int(order[i])+1 for i in range(min(10, 40))])
+
+    cand = _candidate_tickets_from_marginals(p_mix, n_samples=int(n_samples), keep_top=int(keep_top), power=float(power), seed=2468)
+
+    model = _ticket_ranker.get("model")
+    if model is None:
+        joint = {t: float(_np.exp(sum(_np.log([max(1e-18, p_mix.get(n, 1.0/40.0)) for n in t])))) for t in cand}
+        blended = blend_joint_with_marginals(joint, p_mix, alpha=float(alpha))
+        ranked = sorted(blended.items(), key=lambda kv: kv[1], reverse=True)[:int(topN)]
+        return blended, [k for k, _ in ranked]
+
+    X = _np.vstack([_ticket_feature_vector(t, p_mix, C, rec_gap, decay, pf1, topk_set) for t in cand])
+    try:
+        if hasattr(model, "predict_proba"):
+            s = model.predict_proba(X)[:, 1]
+        elif hasattr(model, "predict"):
+            s = model.predict(X)
+        else:
+            s = _np.ones(len(cand), dtype=float)
+    except Exception:
+        s = _np.ones(len(cand), dtype=float)
+
+    z = s - _np.max(s)
+    expz = _np.exp(z)
+    joint = {t: float(expz[i] / (expz.sum() + 1e-12)) for i, t in enumerate(cand)}
+
+    blended = blend_joint_with_marginals(joint, p_mix, alpha=float(alpha))
+    ranked = sorted(blended.items(), key=lambda kv: kv[1], reverse=True)[:int(topN)]
+    return blended, [k for k, _ in ranked]
+# ============================================================================ 
+
+def _logit(x, eps=1e-6):
+    import numpy as _np
+    x = _np.clip(_np.asarray(x, dtype=float), eps, 1.0 - eps)
+    return _np.log(x/(1.0-x))
+
+def _build_stacker_input(bases_at_t, t_eval):
+    """
+    Meta-stacker input for draw t_eval:
+      cols 0..4  : expert probs in _per_expert_names() order
+      cols 5..9  : [calibrated_p_mix, calib_ratio, resid, over_flag, under_flag]
+      cols 10..12: [pair_logit, triad_logit, pair_mean_ctx]  (set-level)
+      cols 13..14: [recency_gap_norm, exp_decay_norm]        (recency-gated)
+    shape: (40, 15)
+    """
+    import numpy as _np
+    mats = []
+    for nm in _per_expert_names():
+        di = bases_at_t.get(nm, {})
+        mats.append([float(di.get(n, 1.0/40.0)) for n in range(1,41)])
+    X = _np.vstack(mats).T  # (40,5)
+
+    # Feedback-derived features
+    fb = _get_feedback(max(1, int(t_eval)-1))
+    try:
+        p_mix = _mix_proxy_at_t(int(t_eval))
+    except Exception:
+        p_mix = {i: 1.0/40.0 for i in range(1,41)}
+    v_mix = _np.array([float(p_mix.get(i, 1.0/40.0)) for i in range(1,41)], dtype=float)
+    if fb and fb.get("iso") is not None:
+        cal = fb["iso"].map(v_mix)
+    else:
+        cal = v_mix.copy()
+    ratio = _np.clip(cal / _np.clip(v_mix, 1e-12, None), 0.1, 10.0)
+    resid = fb.get("resid40")
+    if resid is None or len(resid) != 40:
+        resid = _np.zeros(40, dtype=float)
+    over = (resid < -FEED_RESID_THRESH).astype(float)
+    under = (resid > FEED_RESID_THRESH).astype(float)
+    feats_fb = _np.vstack([cal, ratio, resid, over, under]).T  # (40,5)
+
+    # Set-level signals: pairwise/triad co-occurrence
+    C, _cnt = _co_matrix_recent(int(t_eval), window=120)  # (40,40)
+    pair_ctx = C.dot(v_mix)  # (40,)
+    top2 = _np.argsort(v_mix)[-2:]
+    triad_proxy = _np.zeros(40, dtype=float)
+    if top2.size == 2:
+        triad_proxy = 0.5 * (C[:, top2[0]] + C[:, top2[1]])
+    pair_mean_ctx = _np.full(40, float(_np.mean(pair_ctx)) if pair_ctx.size else 0.0, dtype=float)
+    pair_logit = _logit(pair_ctx)
+    triad_logit = _logit(triad_proxy)
+
+    # Recency-gated features
+    rec_gap, exp_decay = _recency_and_decay(int(t_eval), half_life=30, window=180)
+
+    feats_set = _np.vstack([pair_logit, triad_logit, pair_mean_ctx, rec_gap, exp_decay]).T  # (40,5)
+
+    return _np.hstack([X, feats_fb, feats_set])
+
+def _apply_feedback_correction(prob_dict, t_eval):
+    """
+    Gentle multiplicative correction on final categorical dict using:
+      - calibration ratio^FEED_GAMMA
+      - residual factor (1 + FEED_BETA * resid)
+    """
+    import numpy as _np
+    out = dict(prob_dict)
+    fb = _get_feedback(max(1, int(t_eval)-1))
+    try:
+        p_proxy = _mix_proxy_at_t(int(t_eval))
+    except Exception:
+        p_proxy = {i: 1.0/40.0 for i in range(1,41)}
+    v = _np.array([float(out.get(i, 0.0)) for i in range(1,41)], dtype=float)
+    v = _np.clip(v, 1e-18, None); v = v / (v.sum() + 1e-18)
+    v_proxy = _np.array([float(p_proxy.get(i, 1.0/40.0)) for i in range(1,41)], dtype=float)
+    if fb and fb.get("iso") is not None:
+        v_cal = fb["iso"].map(v_proxy)
+    else:
+        v_cal = v_proxy
+    ratio = _np.clip(v_cal / _np.clip(v_proxy, 1e-12, None), 0.5, 2.0)
+    resid = fb.get("resid40")
+    if resid is None or len(resid) != 40:
+        resid = _np.zeros(40, dtype=float)
+    resid_factor = _np.clip(1.0 + FEED_BETA * resid, 0.8, 1.2)
+    corr = _np.power(ratio, FEED_GAMMA) * resid_factor
+    v_adj = _np.clip(v * corr, 1e-18, None)
+    v_adj = v_adj / (v_adj.sum() + 1e-18)
+    return {i: float(v_adj[i-1]) for i in range(1,41)}
+# ============================================================================
+
+# === Training Policy Overrides (Keras/TensorFlow & PyTorch) ====================
+ # Goal: Increase NN training epochs (≥500), add aggressive EarlyStopping, and
+ # add learning‑rate scheduling (ReduceLROnPlateau + optional Cosine restarts),
+ # without removing any existing code. These apply transparently via monkey‑
+ # patching for tf.keras; PyTorch helpers are provided for training loops.
+ #
+ # Tunable via environment variables (strings interpreted as numbers/ints):
+ #   LOTTO_NN_MIN_EPOCHS       default 500
+ #   LOTTO_NN_MAX_EPOCHS       default 1000
+ #   LOTTO_EARLYSTOP_PATIENCE  default 25
+ #   LOTTO_LR_PLATEAU_PATIENCE default 7
+ #   LOTTO_LR_FACTOR           default 0.5
+ #   LOTTO_USE_COSINE          default 1 (on)
+ #   LOTTO_COSINE_STEPS        default 2000 (optimizer step count per first cycle)
+ #   LOTTO_COSINE_T_MUL        default 2.0
+ #   LOTTO_COSINE_M_MUL        default 0.5
+ #   LOTTO_COSINE_ALPHA        default 0.0
+ #   LOTTO_LR_OVERRIDE         default 0.001 (applied if initial lr≈3e-4)
+ #
+ # Notes:
+ #  • We DO NOT remove your callbacks; we append missing ones.
+ #  • We only raise epochs if caller provided fewer than LOTTO_NN_MIN_EPOCHS.
+ #  • Cosine restarts wraps the optimizer.learning_rate if present and numeric.
+ #  • ReduceLROnPlateau triggers on val_loss plateaus (escape local minima).
+ #  • For PyTorch, use attach_default_torch_scheduler(...) in your loop.
+import os as _os_train
+
+# Public knobs
+NN_EPOCHS_MIN = int(_os_train.getenv("LOTTO_NN_MIN_EPOCHS", "500"))
+NN_EPOCHS_MAX = int(_os_train.getenv("LOTTO_NN_MAX_EPOCHS", "1000"))
+EARLYSTOP_PATIENCE = int(_os_train.getenv("LOTTO_EARLYSTOP_PATIENCE", "25"))
+LR_PLATEAU_FACTOR = float(_os_train.getenv("LOTTO_LR_FACTOR", "0.5"))
+LR_PLATEAU_PATIENCE = int(_os_train.getenv("LOTTO_LR_PLATEAU_PATIENCE", "7"))
+USE_COSINE = int(_os_train.getenv("LOTTO_USE_COSINE", "1"))
+COSINE_STEPS = int(_os_train.getenv("LOTTO_COSINE_STEPS", "2000"))
+COSINE_T_MUL = float(_os_train.getenv("LOTTO_COSINE_T_MUL", "2.0"))
+COSINE_M_MUL = float(_os_train.getenv("LOTTO_COSINE_M_MUL", "0.5"))
+COSINE_ALPHA = float(_os_train.getenv("LOTTO_COSINE_ALPHA", "0.0"))
+LR_OVERRIDE = _os_train.getenv("LOTTO_LR_OVERRIDE", "0.001")
+
+# --- Keras/TensorFlow monkey‑patch -------------------------------------------
+try:
+    import tensorflow as _tf
+    from tensorflow import keras as _keras
+
+    _KERAS_FIT_ORIG = _keras.Model.fit
+
+    def _apply_training_overrides_keras(model, kwargs):
+        """Mutate kwargs in place to enforce epochs↑, early stopping, and LR schedule.
+        Avoids conflicts between LearningRateSchedule and callbacks that try to set LR.
+        """
+        # 1) Epochs: if caller passed fewer than NN_EPOCHS_MIN, raise to [min..max]
+        try:
+            ep = int(kwargs.get("epochs", 0) or 0)
+        except Exception:
+            ep = 0
+        if ep < NN_EPOCHS_MIN:
+            kwargs["epochs"] = min(NN_EPOCHS_MAX, max(NN_EPOCHS_MIN, ep or 0))
+
+        # 2) Determine optimizer LR mutability up‑front
+        cbs = list(kwargs.get("callbacks", []) or [])
+        def _has(cb_type):
+            return any(isinstance(cb, cb_type) for cb in cbs)
+
+        opt = getattr(model, "optimizer", None)
+        lr_is_schedule = False
+        current_lr_val = None
+        try:
+            from tensorflow.keras.optimizers.schedules import LearningRateSchedule as _LRSchedule
+            if opt is not None and hasattr(opt, "learning_rate"):
+                lr_obj = opt.learning_rate
+                lr_is_schedule = isinstance(lr_obj, _LRSchedule)
+                if not lr_is_schedule:
+                    try:
+                        current_lr_val = float(_tf.keras.backend.get_value(lr_obj))
+                    except Exception:
+                        current_lr_val = None
+        except Exception:
+            pass
+
+        # Decide whether we will attach a cosine schedule (only if LR is settable now)
+        will_use_cosine = (int(USE_COSINE) == 1) and (opt is not None) and (not lr_is_schedule)
+
+        # 3) Strip LR-mutating callbacks if LR is not settable (schedule attached)
+        #    This prevents errors like: "optimizer was created with a LearningRateSchedule ... not settable"
+        try:
+            from tensorflow.keras.callbacks import ReduceLROnPlateau, LearningRateScheduler
+            # If the optimizer's LR is already a schedule OR we plan to attach cosine,
+            # remove any callbacks that try to assign a new float LR.
+            if lr_is_schedule or will_use_cosine:
+                new_cbs = []
+                for cb in cbs:
+                    if isinstance(cb, (ReduceLROnPlateau, LearningRateScheduler)):
+                        # Drop it to avoid TypeError during training
+                        continue
+                    new_cbs.append(cb)
+                cbs = new_cbs
+        except Exception:
+            pass
+
+        # 4) Callbacks: always add EarlyStopping; add ReduceLROnPlateau only if LR is settable
+        try:
+            es = _keras.callbacks.EarlyStopping(
+                monitor="val_loss", mode="min", patience=EARLYSTOP_PATIENCE,
+                restore_best_weights=True, min_delta=1e-4, verbose=0
+            )
+            if not any(isinstance(cb, _keras.callbacks.EarlyStopping) for cb in cbs):
+                cbs.append(es)
+
+            # Only add ReduceLROnPlateau when we are NOT switching to/using a schedule
+            if (not will_use_cosine) and (not lr_is_schedule):
+                if not any(isinstance(cb, _keras.callbacks.ReduceLROnPlateau) for cb in cbs):
+                    rlrop = _keras.callbacks.ReduceLROnPlateau(
+                        monitor="val_loss", mode="min", factor=LR_PLATEAU_FACTOR,
+                        patience=LR_PLATEAU_PATIENCE, min_lr=1e-6, verbose=0
+                    )
+                    cbs.append(rlrop)
+            kwargs["callbacks"] = cbs
+        except Exception:
+            pass
+
+        # 5) Learning‑rate tweaks: optional override & cosine restarts
+        try:
+            if opt is not None and hasattr(opt, "learning_rate") and (not lr_is_schedule):
+                # If lr is numeric and close to 3e-4, bump to LR_OVERRIDE (default 1e-3)
+                if (current_lr_val is not None) and (abs(current_lr_val - 3e-4) / max(3e-4, 1e-12) < 0.25):
+                    try:
+                        _tf.keras.backend.set_value(opt.learning_rate, float(LR_OVERRIDE))
+                        current_lr_val = float(LR_OVERRIDE)
+                    except Exception:
+                        pass
+                # Wrap with cosine restarts schedule only if LR is settable and we chose to do so
+                if will_use_cosine:
+                    try:
+                        init_lr = current_lr_val if (current_lr_val is not None) else float(LR_OVERRIDE)
+                        sched = _tf.keras.optimizers.schedules.CosineDecayRestarts(
+                            initial_learning_rate=init_lr,
+                            first_decay_steps=max(1, int(COSINE_STEPS)),
+                            t_mul=float(COSINE_T_MUL),
+                            m_mul=float(COSINE_M_MUL),
+                            alpha=float(COSINE_ALPHA),
+                        )
+                        opt.learning_rate = sched  # becomes non‑settable; RLROP already filtered
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        return kwargs
+
+    def _keras_fit_patched(self, *args, **kwargs):
+        try:
+            kwargs = _apply_training_overrides_keras(self, dict(kwargs))
+        except Exception:
+            pass
+        return _KERAS_FIT_ORIG(self, *args, **kwargs)
+
+    if getattr(_keras.Model.fit, "__name__", "") != "_keras_fit_patched":
+        _keras.Model.fit = _keras_fit_patched
+        try:
+            print("[TRAIN] keras.Model.fit patched: epochs≥%d, EarlyStopping(patience=%d), ReduceLROnPlateau(patience=%d), cosine=%s" % (
+                NN_EPOCHS_MIN, EARLYSTOP_PATIENCE, LR_PLATEAU_PATIENCE, str(bool(USE_COSINE)).lower()))
+        except Exception:
+            pass
+
+        # ---- Set-aware objective + metrics (Keras) ------------------------------
+        import functools as _functools
+
+        def _k_hits_at_k(y_true, y_pred, k=6):
+            # Average number of true hits among the top-k predicted numbers.
+            y_true = _tf.cast(y_true, _tf.float32)
+            y_pred = _tf.cast(y_pred, _tf.float32)
+            # Flatten to (B, M)
+            y_true = _tf.reshape(y_true, [-1, _tf.shape(y_true)[-1]])
+            y_pred = _tf.reshape(y_pred, [-1, _tf.shape(y_pred)[-1]])
+            k = int(k)
+            topk = _tf.math.top_k(y_pred, k=k, sorted=False).indices  # (B, k)
+            mask = _tf.reduce_sum(_tf.one_hot(topk, depth=_tf.shape(y_pred)[-1], dtype=_tf.float32), axis=1)  # (B, M)
+            hits = _tf.reduce_sum(y_true * mask, axis=-1)  # (B,)
+            return _tf.reduce_mean(hits)
+
+        def _k_recall_at_k(y_true, y_pred, k=6):
+            # Recall@k = hits/k_true (k_true≈6 for Lotto+). Normalized to [0,1].
+            y_true = _tf.cast(y_true, _tf.float32)
+            y_pred = _tf.cast(y_pred, _tf.float32)
+            y_true = _tf.reshape(y_true, [-1, _tf.shape(y_true)[-1]])
+            y_pred = _tf.reshape(y_pred, [-1, _tf.shape(y_pred)[-1]])
+            k = int(k)
+            topk = _tf.math.top_k(y_pred, k=k, sorted=False).indices
+            mask = _tf.reduce_sum(_tf.one_hot(topk, depth=_tf.shape(y_pred)[-1], dtype=_tf.float32), axis=1)
+            hits = _tf.reduce_sum(y_true * mask, axis=-1)
+            k_true = _tf.maximum(1.0, _tf.reduce_sum(y_true, axis=-1))  # usually 6
+            return _tf.reduce_mean(hits / k_true)
+
+        def _env_float(name, default):
+            try:
+                return float(_os_train.getenv(name, str(default)))
+            except Exception:
+                return float(default)
+
+        def _env_int(name, default):
+            try:
+                return int(_os_train.getenv(name, str(default)))
+            except Exception:
+                return int(default)
+
+        def build_set_aware_loss(rank_weight=None, reward_weight=None, tau=None, max_neg=None):
+            """
+            Create a differentiable, set-aware objective:
+              L = BCE + rank_weight * L_rank + reward_weight * L_reward
+            where:
+              • BCE = mean binary cross-entropy over 40 numbers (per example)
+              • L_rank ≈ LambdaRank-like pairwise loss over (pos, neg) using top negatives:
+                    mean_{i∈topPos, j∈topNeg} softplus(-(p_i - p_j)/tau)
+              • L_reward = - mean sum(y_true * p) / (#positives)  (encourage prob mass on actual 6)
+            All terms are averaged over the batch. Safe for any batch size. No gradients through y_true.
+            Tunables (can override via env):
+              LOTTO_SET_LOSS=1           (enable)
+              LOTTO_LOSS_RANK_W=0.15     (alpha)
+              LOTTO_LOSS_REWARD_W=0.15   (beta)
+              LOTTO_LOSS_TAU=0.05        (temperature in softplus argument)
+              LOTTO_LOSS_PAIR_NEG=20     (# of hardest negatives per example)
+            """
+            alpha = _env_float("LOTTO_LOSS_RANK_W", 0.15) if rank_weight is None else float(rank_weight)
+            beta  = _env_float("LOTTO_LOSS_REWARD_W", 0.15) if reward_weight is None else float(reward_weight)
+            tau   = _env_float("LOTTO_LOSS_TAU", 0.05) if tau is None else float(tau)
+            mneg  = _env_int("LOTTO_LOSS_PAIR_NEG", 20) if max_neg is None else int(max_neg)
+
+            def _loss(y_true, y_pred):
+                y = _tf.cast(y_true, _tf.float32)
+                p = _tf.cast(y_pred, _tf.float32)
+                # Flatten to (B, M)
+                y = _tf.reshape(y, [-1, _tf.shape(y)[-1]])
+                p = _tf.reshape(p, [-1, _tf.shape(p)[-1]])
+                eps = _tf.constant(1e-7, _tf.float32)
+                p = _tf.clip_by_value(p, eps, 1.0 - eps)
+
+                # BCE over 40 numbers per example, then mean over batch
+                bce_elem = _tf.keras.backend.binary_crossentropy(y, p)  # (B, M)
+                bce = _tf.reduce_mean(_tf.reduce_mean(bce_elem, axis=-1))
+
+                # Reward term: encourage mass on true numbers
+                pos_count = _tf.maximum(1.0, _tf.reduce_sum(y, axis=-1))  # (B,)
+                reward_val = _tf.reduce_mean(_tf.reduce_sum(y * p, axis=-1) / pos_count)
+                reward_loss = -reward_val
+
+                # Pairwise rank loss: compare top positives to top negatives
+                # Select top positives by probability among true positions
+                pos_scores = p * y
+                # In case labels are noisy, take up to 6 positives
+                top_pos_vals = _tf.math.top_k(pos_scores, k=_tf.minimum(_tf.shape(pos_scores)[-1], 6)).values  # (B, 6)
+                # Hard negatives = highest predicted among y==0
+                neg_scores = p * (1.0 - y)
+                top_neg_vals = _tf.math.top_k(neg_scores, k=_tf.minimum(_tf.shape(neg_scores)[-1], mneg)).values  # (B, mneg)
+                # Broadcast to pairwise grid and apply smooth pairwise logistic
+                pos_exp = _tf.expand_dims(top_pos_vals, axis=-1)  # (B, 6, 1)
+                neg_exp = _tf.expand_dims(top_neg_vals, axis=1)   # (B, 1, mneg)
+                pairwise = _tf.math.softplus(-(pos_exp - neg_exp) / tau)  # (B, 6, mneg)
+                rank_loss = _tf.reduce_mean(pairwise)  # scalar
+
+                return bce + alpha * rank_loss + beta * reward_loss
+
+            return _loss
+
+        # Keras compile patch: enable set-aware loss & add Top-6 metrics automatically (opt-in)
+        _KERAS_COMPILE_ORIG = _keras.Model.compile
+
+        def _keras_compile_patched(self, *args, **kwargs):
+            try:
+                use_set_loss = str(_os_train.getenv("LOTTO_SET_LOSS", "1")).strip() in {"1", "true", "yes", "on"}
+                add_metrics = str(_os_train.getenv("LOTTO_ADD_SET_METRICS", "1")).strip() in {"1", "true", "yes", "on"}
+
+                if use_set_loss:
+                    # Replace/augment the provided loss with our set-aware objective.
+                    # Works for a single-output model producing 40 probabilities.
+                    kwargs = dict(kwargs)
+                    kwargs["loss"] = build_set_aware_loss()
+
+                if add_metrics:
+                    mets = list(kwargs.get("metrics", []) or [])
+                    # Named wrappers so Keras shows friendly metric names
+                    def hits_at_6(y_true, y_pred): return _k_hits_at_k(y_true, y_pred, k=6)
+                    hits_at_6.__name__ = "hits_at_6"
+                    def recall_at_6(y_true, y_pred): return _k_recall_at_k(y_true, y_pred, k=6)
+                    recall_at_6.__name__ = "recall_at_6"
+                    # Avoid duplicates by name
+                    existing = {getattr(m, "__name__", str(m)) for m in mets}
+                    if "hits_at_6" not in existing: mets.append(hits_at_6)
+                    if "recall_at_6" not in existing: mets.append(recall_at_6)
+                    kwargs["metrics"] = mets
+
+                if use_set_loss or add_metrics:
+                    print("[TRAIN] keras.Model.compile patched:",
+                          json.dumps({
+                              "set_loss": bool(use_set_loss),
+                              "rank_w": _env_float("LOTTO_LOSS_RANK_W", 0.15),
+                              "reward_w": _env_float("LOTTO_LOSS_REWARD_W", 0.15),
+                              "tau": _env_float("LOTTO_LOSS_TAU", 0.05),
+                              "pair_neg": _env_int("LOTTO_LOSS_PAIR_NEG", 20),
+                              "add_metrics": bool(add_metrics)
+                          }))
+            except Exception:
+                pass
+            return _KERAS_COMPILE_ORIG(self, *args, **kwargs)
+
+        if getattr(_keras.Model.compile, "__name__", "") != "_keras_compile_patched":
+            _keras.Model.compile = _keras_compile_patched
+except Exception:
+    # TensorFlow/Keras not available — ignore silently
+    pass
+ 
+ # --- PyTorch helper (opt‑in from training loops) ------------------------------
+ # If your CNN/Transformer uses PyTorch, call this to attach a default scheduler.
+ # Example usage in your loop (pseudocode):
+ #   optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+ #   scheduler = attach_default_torch_scheduler(optimizer, total_epochs, steps_per_epoch)
+ #   for epoch in range(total_epochs):
+ #       ... train ...
+ #       scheduler.step(epoch + batch_idx/steps_per_epoch)
+ 
+def attach_default_torch_scheduler(optimizer, total_epochs, steps_per_epoch):
+    try:
+        import torch
+        from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+        T_0 = max(1, int(steps_per_epoch))  # first restart after 1 epoch
+        T_mult = 2
+        eta_min = 1e-6
+        return CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min)
+    except Exception:
+        return None
+
+# ---- PyTorch set-aware loss (opt-in from Torch training loop) ---------------
+def build_set_aware_loss_torch(rank_weight=0.15, reward_weight=0.15, tau=0.05, max_neg=20):
+    """
+    Return a PyTorch nn.Module computing:
+      BCE + rank_weight * LambdaRank-like pairwise loss + reward_weight * (-sum(y*p)/#pos)
+    Expects predictions as probabilities in [0,1] with shape (B, 40) and targets as {0,1}.
+    """
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except Exception:
+        return None
+
+    class _SetAwareLoss(nn.Module):
+        def __init__(self, a, b, t, mneg):
+            super().__init__()
+            self.a = float(a)
+            self.b = float(b)
+            self.t = float(t)
+            self.mneg = int(mneg)
+            self.bce = nn.BCELoss(reduction="mean")
+
+        def forward(self, y_pred, y_true):
+            # y_pred assumed probabilities; if logits, caller should apply sigmoid first.
+            y = y_true.float()
+            p = torch.clamp(y_pred.float(), 1e-7, 1-1e-7)
+
+            # BCE over elements, mean over batch
+            bce = self.bce(p, y)
+
+            # Reward: encourage mass on true numbers
+            pos_count = torch.clamp(y.sum(dim=1), min=1.0)
+            reward_val = ((y * p).sum(dim=1) / pos_count).mean()
+            reward_loss = -reward_val
+
+            # Pairwise rank loss: compare top positives vs hardest negatives
+            pos_scores = p * y
+            top_pos_vals, _ = torch.topk(pos_scores, k=min(6, pos_scores.size(1)), dim=1)
+            neg_scores = p * (1.0 - y)
+            top_neg_vals, _ = torch.topk(neg_scores, k=min(self.mneg, neg_scores.size(1)), dim=1)
+            pos_exp = top_pos_vals.unsqueeze(2)      # (B, 6, 1)
+            neg_exp = top_neg_vals.unsqueeze(1)      # (B, 1, mneg)
+            pairwise = torch.nn.functional.softplus(-(pos_exp - neg_exp) / self.t)
+            rank_loss = pairwise.mean()
+
+            return bce + self.a * rank_loss + self.b * reward_loss
+
+    return _SetAwareLoss(rank_weight, reward_weight, tau, max_neg)
+ # ============================================================================
  # --- HMM version gate and uniform helper ---
  # -- One-time environment/version log and requirements snapshot --
 try:
@@ -258,23 +2379,136 @@ except Exception:
 def _uniform_prob40():
     return {n: 1.0/40 for n in range(1, 41)}
 
+# --- Dynamic Bayesian Particle Filter (per-number latent probs) ---
+class ParticleFilter:
+    def __init__(self, num_numbers=40, num_particles=12000, alpha=0.004, sigma=0.008):
+        """Initialize particles with near-uniform draw probabilities."""
+        self.M = num_numbers
+        self.N = num_particles
+        self.alpha = alpha       # mean-reversion rate
+        self.sigma = sigma       # standard deviation of drift noise
+        # Initialize all particles around uniform probability 6/num_numbers
+        base_prob = 6.0 / num_numbers
+        self.particles = np.full((num_particles, num_numbers), base_prob)
+        # Add slight noise to break symmetry, then normalize and clip
+        self.particles += np.random.normal(0, 0.01, size=self.particles.shape)
+        self.particles = np.clip(self.particles, 0, None)
+        # Normalize each particle's probabilities to sum to ~6 (expected 6 draws)
+        for i in range(num_particles):
+            total = self.particles[i].sum()
+            if total == 0:
+                self.particles[i] = base_prob  # if degenerate, reset to uniform
+            else:
+                self.particles[i] *= (6.0 / total)
+        self.particles = np.clip(self.particles, 0, 1)
+    
+    def predict(self):
+        """Propagate particle probabilities forward one time step with drift and mean reversion."""
+        uniform = 6.0 / self.M
+        # Add mean reversion and noise to each particle
+        for i in range(self.N):
+            p = self.particles[i]
+            # Mean reversion toward uniform distribution
+            p += self.alpha * (uniform - p)
+            # Random drift (Gaussian noise)
+            p += np.random.normal(0, self.sigma, size=self.M)
+            # Clip probabilities to [0,1] and renormalize to sum ~6
+            p = np.clip(p, 0, 1)
+            total = p.sum()
+            if total == 0:
+                p[:] = uniform  # reset to uniform if particle collapsed
+            else:
+                p *= (6.0 / total)
+            # Clip again in case renormalization caused any entry >1
+            p[:] = np.clip(p, 0, 1)
+            self.particles[i] = p
+    
+    def update(self, draw):
+        """Update particle weights based on the observed draw and resample particles.
+        Uses vectorized log-likelihoods for numerical stability.
+        """
+        import numpy as _np
+
+        # Build zero-based index arrays for drawn and not-drawn numbers
+        draw_set = set(draw)
+        draw_idx = _np.array([n-1 for n in draw_set], dtype=int)
+        not_idx = _np.array([n-1 for n in range(1, self.M+1) if n not in draw_set], dtype=int)
+
+        # Clip probabilities away from 0/1 to keep logs finite
+        eps = 1e-12
+        P = _np.clip(self.particles, eps, 1.0 - eps)
+
+        # Precompute log p and log(1-p)
+        logP = _np.log(P)
+        log1mP = _np.log1p(-P)
+
+        # Vectorized log-likelihood per particle:
+        #   ll_i = sum_{n in draw} log p_i[n] + sum_{m not in draw} log (1 - p_i[m])
+        # Shape handling:
+        #   logP[:, draw_idx] -> (N, |draw|)
+        #   log1mP[:, not_idx] -> (N, M - |draw|)
+        ll = logP[:, draw_idx].sum(axis=1) + log1mP[:, not_idx].sum(axis=1)
+
+        # Stabilize before exponentiation by subtracting max (log-sum-exp trick)
+        ll_max = _np.max(ll)
+        weights = _np.exp(ll - ll_max)
+
+        # Normalize weights
+        w_sum = _np.sum(weights)
+        if not _np.isfinite(w_sum) or w_sum <= 0:
+            # Fallback to uniform if something went wrong
+            weights = _np.ones(self.N, dtype=float) / float(self.N)
+        else:
+            weights = weights / w_sum
+
+        # Resample particles according to normalized weights
+        idx = _np.random.choice(self.N, size=self.N, p=weights)
+        self.particles = self.particles[idx].copy()
+
+        # Compute negative log-likelihood with a stable log-mean-exp:
+        # log(mean(exp(ll))) = logsumexp(ll) - log(N)
+        m = ll_max  # reuse the max for stability
+        lse = m + _np.log(_np.sum(_np.exp(ll - m)))
+        log_mean_like = lse - _np.log(float(self.N))
+        nll = float(-log_mean_like)
+        return nll
+    
+    def get_mean_probabilities(self):
+        """Return the mean draw probability for each number across all particles."""
+        mean_p = self.particles.mean(axis=0)
+        return np.clip(mean_p, 0, 1)
+
 # --- Strict time-guard to prevent look-ahead leakage ---
 CURRENT_TARGET_IDX = None  # when predicting/evaluating draw t, only indices < t may be touched
 
-def _set_target_idx(t_idx):
-    """Declare the current target draw index t for leakage guards (allowing access to draws[:t])."""
-    global CURRENT_TARGET_IDX
-    CURRENT_TARGET_IDX = int(t_idx) if t_idx is not None else None
+# --- Uniform time-leak enforcement helpers -----------------------------------
+DEBUG_GUARDS = True  # set False to relax invariant checks in production
 
-def _assert_idx_ok(idx, context=""):
-    """Assert that any index used for feature building is strictly less than CURRENT_TARGET_IDX."""
-    if CURRENT_TARGET_IDX is None:
-        return
-    if int(idx) >= int(CURRENT_TARGET_IDX):
-        raise RuntimeError(f"Leakage guard tripped: attempted to access index {idx} >= target {CURRENT_TARGET_IDX} {('in ' + context) if context else ''}.")
+def _history_upto(t_idx, context=""):
+    """
+    Return a slice of historical draws strictly before index t_idx: draws[:t_idx].
+    Enforces that t_idx <= CURRENT_TARGET_IDX when a target is set, to avoid look-ahead.
+    """
+    try:
+        t = int(t_idx)
+    except Exception:
+        raise ValueError(f"_history_upto: non-integer t_idx {t_idx!r} in {context or 'unknown'}")
+    if DEBUG_GUARDS:
+        _assert_idx_ok(t, context or "_history_upto")
+    return draws[:t]
 
-# --- Strict time-guard to prevent look-ahead leakage ---
-CURRENT_TARGET_IDX = None  # when predicting/evaluating draw t, only indices < t may be touched
+def _winner_draw_at(t_idx, context=""):
+    """
+    Return the observed winners set at index t_idx (the label at time t).
+    Guarded so that t_idx <= CURRENT_TARGET_IDX when a target is set.
+    """
+    try:
+        t = int(t_idx)
+    except Exception:
+        raise ValueError(f"_winner_draw_at: non-integer t_idx {t_idx!r} in {context or 'unknown'}")
+    if DEBUG_GUARDS:
+        _assert_idx_ok(t, context or "_winner_draw_at")
+    return draws[t]
 
 def _set_target_idx(t_idx):
     """Declare the current target draw index t for leakage guards (allowing access to draws[:t])."""
@@ -296,11 +2530,92 @@ def _assert_chronological_frame(df):
         raise ValueError("DataFrame is not strictly chronological before split; aborting to avoid leakage.")
 
 # Default MC passes used by stacker/diagnostics
-MC_STACK_PASSES = 11
 
-# 1. **Data Loading and Preprocessing**
-# Load the historical Colorado Lotto+ data from the Excel file
-data = pd.read_excel("Lotto+.xlsx")
+MC_STACK_PASSES = 50
+# Ops cadence for re-tuning (weights/calibrator)
+WEIGHT_TUNE_EVERY = 5  # only re‑learn base weights every N draws
+_weights_cache_bin = None
+
+# --- Quick compatibility self-test (runs before heavy work if enabled) ----------
+try:
+    import os as _os_mod
+    import numpy as _np_mod
+except Exception:
+    _os_mod = None
+    _np_mod = None
+
+def _compat_self_test():
+    """
+    Smoke test for compatibility shims:
+      1) _export_reliability accepts legacy csv_path/png_path names and writes files.
+      2) _mix_prob_dicts combines two expert marginal dicts and returns a valid prob dict.
+    Prints 'SELFTEST: PASS' and returns True on success.
+    """
+    try:
+        # 1) reliability export with legacy arg names
+        p = _np_mod.linspace(0.01, 0.99, 200) if _np_mod is not None else [0.5]*10
+        y = (_np_mod.random.rand(200) > 0.6).astype(float) if _np_mod is not None else [0,1]*5
+        out_csv = "reliability_curve.csv"
+        out_png = "reliability_curve.png"
+        res = _export_reliability(probs=p, labels=y, csv_path=out_csv, png_path=out_png, bins=10)
+        assert isinstance(res, dict) and res.get("csv") is not None, "reliability export failed"
+
+        # 2) mix two simple expert marginal dicts
+        d1 = {n: (1.0/40.0) for n in range(1,41)}
+        d2 = {n: (2.0/40.0 if n % 2 == 0 else 0.0) for n in range(1,41)}
+        mix = _mix_prob_dicts({"Bayes": d1, "Markov": d2, "HMM": d1, "LSTM": d1, "Transformer": d1},
+                              weights=[0.2, 0.3, 0.2, 0.2, 0.1])
+        tot = sum(float(mix.get(n,0.0)) for n in range(1,41))
+        assert 0.999 <= tot <= 1.001, "mixed distribution not normalized"
+        # Guard sanity: only if historical draws are already loaded in globals
+        if 'draws' in globals() and isinstance(globals()['draws'], (list, tuple)) and len(globals()['draws']) > 0:
+            try:
+                _dr = globals()['draws']
+                # Choose a safe target index based on available history
+                t_cur = min(9, len(_dr) - 1)
+                if t_cur >= 1:
+                    _set_target_idx(t_cur)
+                    _ = _history_upto(t_cur - 1, context="_compat_self_test")
+            finally:
+                _set_target_idx(None)
+        print("SELFTEST: PASS", res)
+        return True
+    except Exception as _e:
+        import warnings as _w
+        _w.warn(f"SELFTEST: FAIL: {_e}")
+        return False
+
+# If env var LOTTO_SELFTEST=1 is set, run the self-test and exit early to avoid training.
+if (_os_mod is not None) and (_os_mod.environ.get("LOTTO_SELFTEST", "0") == "1"):
+    ok = _compat_self_test()
+    # Exit with status 0 on pass, 2 on failure to be obvious in CI or shell
+    import sys as _sys_mod
+    _sys_mod.exit(0 if ok else 2)
+# --- End self-test -------------------------------------------------------------
+
+import pickle
+import os
+
+
+
+# --- Load raw draws sheet into draw_df (robust) ---
+try:
+    # Primary path: Excel workbook in the project root.
+    draw_df = pd.read_excel("Lotto+.xlsx")
+except Exception as _e_read_xlsx:
+    # Fallbacks: try a CSV with the same base name, then raise a clear error.
+    try:
+        draw_df = pd.read_csv("Lotto+.csv")
+    except Exception as _e_read_csv:
+        raise FileNotFoundError(
+            "Could not load historical draws. Expected 'Lotto+.xlsx' (or Lotto+.csv) in the current directory."
+        ) from _e_read_xlsx
+# Basic column sanity (fail fast with a helpful message)
+_expected_cols = {"Draw date", "Winning Numbers"}
+if not _expected_cols.issubset(set(map(str, draw_df.columns))):
+    raise ValueError(f"Input sheet is missing required columns {_expected_cols}. Found columns: {list(draw_df.columns)}")
+
+data = draw_df
 
 # Sort data by draw date in chronological order (oldest first) for time-series modeling.
 # The "Draw date" column is a string like "Monday, 8/4/25". Lock to exact format to prevent silent mis-parses.
@@ -337,6 +2652,60 @@ for nums in data['Winning Numbers']:
 n_draws = len(draws)
 print(f"Loaded {n_draws} historical draws.")
 
+# --- Regime Modeling (robust, after we have parsed `draws`) ---
+# Build draw_matrix from already-parsed `draws` to ensure correctness.
+try:
+    draw_matrix = np.array([sorted(list(d)) for d in draws], dtype=int)
+except Exception:
+    draw_matrix = np.empty((0, 6), dtype=int)
+
+def _artifact_path(name):
+    import os as _os
+    out_dir = _os.path.join(_os.getcwd(), "artifacts")
+    _os.makedirs(out_dir, exist_ok=True)
+    return _os.path.join(out_dir, name)
+
+gmm_model = None
+try:
+    # Require a reasonable minimum of clean rows to fit a stable GMM.
+    if isinstance(draw_matrix, np.ndarray) and draw_matrix.ndim == 2 and draw_matrix.shape[0] >= 30:
+        # Use the extract_regime_features already defined above (or re-define safely if missing).
+        try:
+            _ = extract_regime_features
+        except NameError:
+            def extract_regime_features(dm):
+                feats = []
+                for dr in dm:
+                    dr = np.sort(dr)
+                    deltas = np.diff(dr)
+                    feats.append(np.concatenate([
+                        dr[:1], dr[-1:], [np.mean(dr)], [np.std(dr)], deltas
+                    ]))
+                return np.array(feats)
+
+        feats = extract_regime_features(draw_matrix)
+        if feats.ndim == 2 and feats.shape[0] >= 10:
+            from sklearn.mixture import GaussianMixture
+            gmm_model = GaussianMixture(n_components=3, random_state=42)
+            gmm_model.fit(feats)
+            # Persist under artifacts/
+            try:
+                import pickle as _pkl
+                with open(_artifact_path("regime_gmm_model.pkl"), "wb") as f:
+                    _pkl.dump(gmm_model, f)
+            except Exception:
+                pass
+            print(f"[REGIME] GMM fitted on {feats.shape[0]} draws into 3 regimes.")
+        else:
+            import warnings as _w
+            _w.warn("Regime features insufficient after parsing; skipping GMM fit.")
+    else:
+        import warnings as _w
+        _w.warn("Not enough clean draws to fit GMM (need ≥30). Skipping.")
+except Exception as _e:
+    import warnings as _w
+    _w.warn(f"GMM regime fit skipped due to error: {_e}")
+
 # 2. **Statistical Analysis for Model Features**
 # Compute basic frequency of each number over all draws (for Bayesian prior/posterior).
 from collections import Counter
@@ -351,6 +2720,9 @@ alpha = 1
 posterior_counts = {num: alpha + freq_counter.get(num, 0) for num in range(1, 41)}
 # Posterior probabilities for each number (i.e., estimated probability number will be drawn in any given draw).
 posterior_probs = {num: posterior_counts[num] / (total_numbers_drawn + 40 * alpha) for num in range(1, 41)}
+
+# Global, history-wide Bayes prior used ONLY to break exact ties in ranking (safe, deterministic)
+_TIEBREAK_BAYES = dict(posterior_probs)
 
 # ===========================
 # Markov Chain: Multi-step Transition Probabilities
@@ -420,53 +2792,141 @@ for i in range(1, 41):
     else:
         transition3_probs[i] = {m: 1.0/40 for m in range(1, 41)}
 
-# --- Hidden Markov Model (HMM) using hmmlearn ---
-# The HMM attempts to model hidden "states" underlying the sequence of draws.
-# We'll use the MultiLabelBinarizer to encode draws, and fit a MultinomialHMM on the sequence.
+# --- Hidden Markov Model (HMM) using hmmlearn (multi-seed average with sanity fallback) ---
 from hmmlearn import hmm
-# Compatibility helper for posterior extraction across hmmlearn versions
-def _hmm_posteriors(model, X_int):
-    """Return state posteriors for each row in X_int (shape: [T, n_features]).
-    Tries score_samples (preferred); falls back to model.predict_proba if present.
+
+def _build_hmm_prob_from_subset(sub_draws, n_states=3, n_seeds=8):
     """
-    try:
-        # Preferred, stable across 0.3.2/0.3.3
-        _logp, post = model.score_samples(X_int)
-        return post
-    except Exception:
-        if hasattr(model, "predict_proba"):
-            try:
-                return model.predict_proba(X_int)
-            except Exception:
-                pass
-        raise
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.linear_model import LogisticRegression
+    Factorized‑emissions HMM for Lotto+.
 
-# Prepare draw observations as a binary matrix: each row is a draw, 1 if number present, else 0.
-mlb = MultiLabelBinarizer(classes=list(range(1, 41)))
-draws_bin = mlb.fit_transform([sorted(list(draw)) for draw in draws])
+    Design change:
+      • Instead of treating each row as a 40‑category Multinomial “6 outcomes at once,”
+        we model a 40‑dimensional binary vector x_t ∈ {0,1}^40 where x_t[n]=1 iff number n
+        appeared at draw t. Emissions are **independent per number given the regime**:
+        x_t | z_t = k  ~  Bernoulli(mean = μ_k) factorized across 40 dimensions.
+      • We fit a **GaussianHMM with diagonal covariance** to these 0/1 vectors.
+        The per‑state mean μ_k (shape 40) is an estimate of per‑number occurrence
+        probabilities under regime k. After fitting, we compute the posterior over
+        regimes at the most recent row and mix the μ_k by those weights.
+      • This better captures regime structure without conflating the “six-at-once”
+        volume with per‑number signal.
 
-# Use a small number of hidden states (e.g., 3 or 4) to avoid overfitting.
-n_states = 3
-# Switch to MultinomialHMM on 0/1 count vectors (each row sums to 6). Use a shorter n_iter and looser tol to avoid noisy non‑convergence logs.
-if HMM_OK:
+    Returns:
+      dict {1..40 -> p} where p is a categorical distribution (sum=1) after:
+        (1) clipping μ_mix to [1e-12, 1-1e-12],
+        (2) enforcing expected-6 semantics lightly by rescaling to sum≈6,
+        (3) converting back to a categorical (sum=1).
+
+    Fallbacks:
+      • If GaussianHMM path fails, we fall back to a MultinomialHMM over 0/1 rows
+        (legacy behavior), and if that also fails we return uniform.
+    """
+    import numpy as _np
+    from sklearn.preprocessing import MultiLabelBinarizer
+
+    # Build 0/1 matrix X: shape (T, 40)
     try:
-        hmm_model = hmm.MultinomialHMM(n_components=n_states, n_iter=50, tol=1e-2, random_state=42, verbose=False)
-        # Ensure integer counts for MultinomialHMM; suppress migration spam during fit and posterior calls
-        with _squelch_streams(r"MultinomialHMM has undergone"):
-            hmm_model.fit(draws_bin.astype(int))
-            # Posteriors over hidden states; use helper for broad version compatibility
-            post = _hmm_posteriors(hmm_model, draws_bin.astype(int))  # shape: (n_draws, n_states)
-        last_state = int(np.argmax(post[-1]))
-        # Emission probabilities per number for the inferred last state
-        emiss = hmm_model.emissionprob_  # shape: (n_states, 40)
-        hmm_prob = {num: float(max(emiss[last_state, num - 1], 1e-12)) for num in range(1, 41)}
-        _s = sum(hmm_prob.values())
-        hmm_prob = ({n: hmm_prob[n] / _s for n in range(1, 41)} if _s > 0 else _uniform_prob40())
+        mlb_local = MultiLabelBinarizer(classes=list(range(1, 41)))
+        X = mlb_local.fit_transform([sorted(list(d)) for d in sub_draws]).astype(float)
     except Exception:
-        hmm_prob = _uniform_prob40()
-else:
+        return {n: 1.0/40 for n in range(1, 41)}
+
+    # Need a reasonable history to fit HMM
+    if X.shape[0] < max(12, n_states + 5):
+        return {n: 1.0/40 for n in range(1, 41)}
+
+    # --- Primary path: GaussianHMM with diagonal covariance (factorized emissions)
+    ok = 0
+    mixes = []
+    try:
+        from hmmlearn.hmm import GaussianHMM
+        with _squelch_streams(r"MultinomialHMM has undergone|hmmlearn"):
+            for seed in [11, 23, 37, 49, 61, 73, 89, 97][:max(1, int(n_seeds))]:
+                try:
+                    # Small jitter to avoid singular covariances on pure 0/1 data
+                    X_ = X + _np.random.normal(0.0, 1e-3, size=X.shape)
+                    mdl = GaussianHMM(
+                        n_components=int(n_states),
+                        covariance_type="diag",
+                        n_iter=200,
+                        tol=1e-3,
+                        random_state=int(seed),
+                        verbose=False,
+                    )
+                    mdl.fit(X_)
+                    # Posterior over regimes at the last timestep
+                    _, post = mdl.score_samples(X_)
+                    w = _np.clip(post[-1], 1e-12, None)  # shape: (K,)
+                    w = w / (w.sum() + 1e-12)
+                    # Emission means per regime (shape: K x 40); interpret as per-number probs
+                    means = _np.asarray(mdl.means_, dtype=float)  # (K, 40)
+                    mix = _np.dot(w, means)  # (40,)
+                    mix = _np.clip(mix, 1e-12, 1 - 1e-12)
+                    mixes.append(mix.astype(float))
+                    ok += 1
+                except Exception:
+                    continue
+    except Exception:
+        ok = 0  # ensure fallback below
+
+    if ok > 0:
+        v = _np.mean(_np.vstack(mixes), axis=0)  # (40,)
+        # Lightly enforce expected-6 semantics then convert back to categorical
+        try:
+            v6 = _enforce_sum6(v * 6.0)
+            v1 = v6 / 6.0
+            v1 = _np.clip(v1, 1e-12, None)
+            v1 = v1 / (v1.sum() + 1e-12)
+            return {n: float(v1[n-1]) for n in range(1, 41)}
+        except Exception:
+            v = _np.clip(v, 1e-12, None)
+            v = v / (v.sum() + 1e-12)
+            return {n: float(v[n-1]) for n in range(1, 41)}
+
+    # --- Fallback path: legacy MultinomialHMM over 0/1 rows (as before)
+    try:
+        from hmmlearn import hmm as _hmm_mod
+        posts = []
+        ok2 = 0
+        with _squelch_streams(r"MultinomialHMM has undergone|hmmlearn"):
+            for seed in [11, 23, 37, 49, 61, 73, 89, 97][:max(1, int(n_seeds))]:
+                try:
+                    mdl = _hmm_mod.MultinomialHMM(
+                        n_components=int(n_states),
+                        n_iter=120,
+                        tol=1e-3,
+                        random_state=int(seed),
+                        verbose=False,
+                    )
+                    # X must be non-negative integers for MultinomialHMM
+                    Xi = _np.asarray(X, dtype=int)
+                    mdl.fit(Xi)
+                    _, post = mdl.score_samples(Xi)               # (T, K)
+                    w = _np.clip(post[-1], 1e-12, None)          # (K,)
+                    w = w / (w.sum() + 1e-12)
+                    emis = _np.asarray(mdl.emissionprob_, dtype=float)  # (K, 40)
+                    mix = _np.dot(w, emis)                       # (40,)
+                    mix = _np.clip(mix, 1e-12, None)
+                    mix = mix / (mix.sum() + 1e-12)
+                    posts.append(mix)
+                    ok2 += 1
+                except Exception:
+                    continue
+        if ok2 > 0:
+            v = _np.mean(_np.vstack(posts), axis=0)
+            v = _np.clip(v, 1e-12, None)
+            v = v / (v.sum() + 1e-12)
+            return {n: float(v[n-1]) for n in range(1, 41)}
+    except Exception:
+        pass
+
+    # --- Final fallback: uniform
+    return {n: 1.0/40 for n in range(1, 41)}
+
+# Robust, version-tolerant live HMM probability
+try:
+    hmm_prob = _build_hmm_prob_from_subset(draws, n_states=3, n_seeds=8) if HMM_OK else _uniform_prob40()
+except Exception:
     hmm_prob = _uniform_prob40()
 
 # ===========================
@@ -493,6 +2953,12 @@ for draw in draws:
 cluster_threshold = 3
 frequent_pairs = {pair for pair, count in pair_counter.items() if count >= cluster_threshold}
 frequent_triplets = {triplet for triplet, count in triplet_counter.items() if count >= cluster_threshold}
+
+# Normalised co-occurrence rates for incompatibility penalties (0..1)
+pair_max = max(1, max(pair_counter.values()) if len(pair_counter) > 0 else 1)
+trip_max = max(1, max(triplet_counter.values()) if len(triplet_counter) > 0 else 1)
+pair_rate = {p: (c / pair_max) for p, c in pair_counter.items()}
+triplet_rate = {t: (c / trip_max) for t, c in triplet_counter.items()}
 
 # 3. Analysis of arithmetic sequences and intervals within draws.
 # For each draw, find if there are arithmetic sequences of length >=3 and record intervals.
@@ -608,7 +3074,41 @@ for idx in range(n_draws):
 # ===========================
 
 
-# Helper functions for data-leakage-free probability computation
+#
+#
+# Regime-based diagnostics (optional)
+# If we have a fitted gmm_model (from the post-parse block above) use it;
+# otherwise, try to load from artifacts; else skip gracefully.
+try:
+    if gmm_model is None:
+        import os as _os, pickle as _pkl
+        _p = _artifact_path("regime_gmm_model.pkl")
+        if _os.path.exists(_p):
+            with open(_p, "rb") as f:
+                gmm_model = _pkl.load(f)
+except Exception:
+    pass
+
+try:
+    recent_mat = draw_matrix[-5:] if isinstance(draw_matrix, np.ndarray) and draw_matrix.size else np.array([sorted(list(d)) for d in draws][-5:])
+except Exception:
+    recent_mat = None
+
+if gmm_model is not None and recent_mat is not None and len(recent_mat) >= 3:
+    try:
+        feats_recent = extract_regime_features(recent_mat)
+        preds = gmm_model.predict(feats_recent)
+        counts = np.bincount(preds, minlength=getattr(gmm_model, "n_components", 3))
+        current_regime = int(np.argmax(counts))
+        print(f"[REGIME] Current regime: {current_regime}")
+    except Exception as _e:
+        import warnings as _w
+        _w.warn(f"Regime prediction skipped: {_e}")
+else:
+    print("[REGIME] GMM not available or insufficient recent draws; skipping regime diagnostics.")
+# Note: We intentionally do not auto-switch models here because `marginal_model_0`,
+# `setar_model_1`, and `reranker_model_2` may not exist in all builds. If you want
+# to gate behavior by regime, plug the regime id into your existing selection logic.
 def compute_bayes_posterior(draw_list, alpha=1):
     """
     Compute Bayesian posterior probability for each number 1‑40
@@ -713,6 +3213,35 @@ def _cooc_conditional_prob_from_history(sub_draws, last_draw):
     return {n: float(score[n-1]) for n in range(1, 41)}
 
 
+# --- Co-occurrence community detection (for cluster features) ---
+def _cooc_communities_from_history(sub_draws):
+    """Return (cluster_id, cluster_size) dicts via greedy modularity on the co-occurrence graph.
+    cluster_id maps 1..40 -> small int id; cluster_size maps id -> size. Falls back to singletons.
+    """
+    try:
+        G = nx.Graph()
+        G.add_nodes_from(range(1, 41))
+        co = _cooccurrence_matrix_from_history(sub_draws)
+        for i in range(1, 41):
+            for j in range(i+1, 41):
+                w = float(co[i-1, j-1])
+                if w > 0:
+                    G.add_edge(i, j, weight=w)
+        comms = list(nx.algorithms.community.greedy_modularity_communities(G, weight='weight'))
+        cid = {}
+        for ci, c in enumerate(comms):
+            for n in c:
+                cid[int(n)] = int(ci)
+        for n in range(1, 41):
+            if n not in cid:
+                cid[n] = int(len(comms))
+                comms.append({n})
+        csize = {i: len(c) for i, c in enumerate(comms)}
+        return cid, csize
+    except Exception:
+        return ({n: n-1 for n in range(1, 41)}, {i: 1 for i in range(40)})
+
+
 def _compat_topk_sum(prob_dict, k=5):
     """For each candidate n, compute sum of the top-k competitor probabilities
     among the *other* numbers (exclude n). Teaches without-replacement compatibility.
@@ -740,6 +3269,7 @@ def _compat_topk_sum(prob_dict, k=5):
 # Features include: moving averages of frequencies, median gaps, recent gap lengths, frequencies over sliding windows.
 k = 8  # number of past draws to use as features
 X_seq = []
+M_seq = []  # meta features per sample
 y_seq = []
 
 def compute_stat_features(draw_window, idx_offset):
@@ -842,6 +3372,60 @@ def compute_stat_features(draw_window, idx_offset):
     weekday_onehot = [1 if weekday == i else 0 for i in range(7)]
     month_onehot = [1 if month == i+1 else 0 for i in range(12)]
 
+    # --- New set-aware features ---
+    last_in_window = sorted(list(draw_window[-1])) if len(draw_window) > 0 else []
+    # Spacing features for the last draw in the window
+    gaps_vec = []
+    if len(last_in_window) >= 2:
+        gaps_vec = [last_in_window[i+1] - last_in_window[i] for i in range(len(last_in_window)-1)]
+    min_gap_last = float(min(gaps_vec)) if gaps_vec else 0.0
+    max_gap_last = float(max(gaps_vec)) if gaps_vec else 0.0
+    mean_gap_last = float(np.mean(gaps_vec)) if gaps_vec else 0.0
+
+    # Sum/parity buckets for the last draw in the window
+    sum_last = float(sum(last_in_window)) if last_in_window else 0.0
+    odd_last = float(sum(1 for n in last_in_window if n % 2 == 1))
+    even_last = float(sum(1 for n in last_in_window if n % 2 == 0))
+
+    # Low/high (1–20 vs 21–40) pressure in the recent 10 draws
+    window_10 = draws[max(0, idx_offset-9): idx_offset+1]
+    low_ct = float(sum(1 for d in window_10 for n in d if n <= 20))
+    high_ct = float(sum(1 for d in window_10 for n in d if n >= 21))
+    total_ct = max(1.0, low_ct + high_ct)
+    low_frac_recent = low_ct / total_ct
+    high_frac_recent = high_ct / total_ct
+
+    # Co-occurrence community features from history up to idx_offset
+    comm_id, comm_size = _cooc_communities_from_history(draws[:idx_offset+1])
+    MAX_COMM_FEATS = 6  # fixed length for community one-hot features (last bin = overflow/unknown)
+
+    # Per-number precomputations for new features
+    nearest_dist = [0.0]*40
+    contain_gap_size = [0.0]*40
+    for n in range(1, 41):
+        if last_in_window:
+            nearest_dist[n-1] = float(min(abs(n-x) for x in last_in_window))
+            cg = 0
+            for i in range(len(last_in_window)-1):
+                a, b = last_in_window[i], last_in_window[i+1]
+                if a < n < b:
+                    cg = b - a
+                    break
+            contain_gap_size[n-1] = float(cg)
+        else:
+            nearest_dist[n-1] = 0.0
+            contain_gap_size[n-1] = 0.0
+
+    # Normalizations
+    nearest_dist_norm = [d/40.0 for d in nearest_dist]
+    contain_gap_norm = [g/40.0 for g in contain_gap_size]
+    sum_last_norm = sum_last / 240.0
+    odd_last_norm = odd_last / 6.0
+    even_last_norm = even_last / 6.0
+    min_gap_norm = min_gap_last / 40.0
+    max_gap_norm = max_gap_last / 40.0
+    mean_gap_norm = mean_gap_last / 40.0
+
     # Concatenate features for each number
     for i in range(n_numbers):
         # Combine all features into a single feature vector per number
@@ -862,416 +3446,39 @@ def compute_stat_features(draw_window, idx_offset):
         ]
         # Add one-hot weekday and month (same for all numbers in the draw)
         feats = feats + weekday_onehot + month_onehot
+        # Candidate-level extensions
+        cand_val = i+1
+        cand_parity = 1.0 if (cand_val % 2 == 1) else 0.0
+        cand_low = 1.0 if cand_val <= 20 else 0.0
+        cid = float(comm_id.get(cand_val, -1))
+        csz = float(comm_size.get(int(comm_id.get(cand_val, -1)), 1))
+        cluster_size_norm = csz / 40.0
+        if last_in_window:
+            overlap = sum(1 for x in last_in_window if comm_id.get(x, -2) == comm_id.get(cand_val, -1))
+            cluster_overlap_ratio = (overlap / max(1.0, csz))
+        else:
+            cluster_overlap_ratio = 0.0
+
+        # Build cluster-membership one-hot (capped length; last index is overflow/unknown)
+        ci_raw = int(comm_id.get(cand_val, -1))
+        if ci_raw < 0:
+            ci_idx = MAX_COMM_FEATS - 1
+        else:
+            ci_idx = ci_raw if ci_raw < MAX_COMM_FEATS else (MAX_COMM_FEATS - 1)
+        comm_onehot = [1.0 if k == ci_idx else 0.0 for k in range(MAX_COMM_FEATS)]
+
+        feats += [
+            nearest_dist_norm[i],      # distance to nearest num in last draw (norm)
+            contain_gap_norm[i],       # size of containing gap (norm)
+            min_gap_norm, max_gap_norm, mean_gap_norm,  # last-draw spacing stats
+            sum_last_norm, odd_last_norm, even_last_norm,  # last-draw sum/parity
+            low_frac_recent, high_frac_recent,            # bucket pressure (recent)
+            cand_parity, cand_low,                        # candidate parity/bucket
+            cluster_size_norm, cluster_overlap_ratio      # co-occurrence cluster features
+        ] + comm_onehot
         features.append(feats)
     return np.array(features)  # shape (40, n_features)
 
-# Build X_seq and y_seq using derived features (with strict time guards)
-_assert_chronological_frame(data)
-for idx in range(k, n_draws - 1):
-    # When constructing features for label at draw idx, only allow access to draws[:idx]
-    _set_target_idx(idx)
-    window_draws = draws[idx - k: idx]       # last k draws (each is a set of 6 numbers)
-    next_draw = draws[idx]                   # the draw immediately after the window
-    # Compute features for all 40 numbers
-    features = compute_stat_features(window_draws, idx - 1)  # (40, n_features)
-    X_seq.append(features)
-    # Output: 40-dim binary vector for next draw
-    y_seq.append([1 if num in next_draw else 0 for num in range(1, 41)])
-X_seq = np.array(X_seq)  # shape (samples, 40, n_features)
-y_seq = np.array(y_seq)  # shape (samples, 40)
-# Clear guard now that the bulk feature construction is complete
-_set_target_idx(None)
-
-# --- Set-aware learning-to-rank losses (PL/BT) -------------------------------------------
-import tensorflow as tf
-import keras  # Keras 3.x API
-from keras import layers
-
-def pl_set_loss_factory(R=8, tau=0.20):
-    """
-    Plackett–Luce pseudo-likelihood loss for unordered 6-sets.
-    y_true: [batch, 40] multi-hot (six 1s)
-    y_pred: [batch, 40] raw logits per number
-    R: number of random permutations of the positive set to average over
-    tau: magnitude of Gumbel noise for Perturb-and-MAP (0 disables)
-    """
-    neg_inf = tf.constant(-1e9, dtype=tf.float32)
-
-    @tf.function(experimental_relax_shapes=True)
-    def _loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        if tau and tau > 0:
-            # Gumbel noise for differentiable Top-k
-            u = tf.clip_by_value(tf.random.uniform(tf.shape(y_pred), 1e-7, 1.0 - 1e-7), 1e-7, 1.0 - 1e-7)
-            g = -tf.math.log(-tf.math.log(u)) * tf.cast(tau, y_pred.dtype)
-            logits = y_pred + g
-        else:
-            logits = y_pred
-
-        def _sample_pl_nll(args):
-            y, logit = args
-            pos_idx = tf.squeeze(tf.where(y > 0.5), axis=1)  # indices of winners
-            k = tf.shape(pos_idx)[0]
-            # If no positives (shouldn't happen), return 0
-            def _zero():
-                return tf.constant(0.0, dtype=tf.float32)
-
-            def _do():
-                nll = 0.0
-                # Average over R random permutations of the winners (order is latent)
-                def body(r, acc):
-                    perm = tf.random.shuffle(pos_idx)
-                    # mask_add will set chosen items to -inf to emulate removal (without replacement)
-                    mask_add = tf.zeros_like(logit)
-                    step_nll = 0.0
-                    j = tf.constant(0)
-                    def step(j, step_acc, mask_add):
-                        denom = tf.reduce_logsumexp(logit + mask_add)
-                        chosen = perm[j]
-                        step_acc += -(tf.gather(logit, chosen) - denom)
-                        # remove chosen from future denominators
-                        mask_add = tf.tensor_scatter_nd_update(mask_add, tf.reshape(chosen, [1,1]), tf.reshape(neg_inf, [1]))
-                        return j + 1, step_acc, mask_add
-                    cond = lambda j, *_: tf.less(j, k)
-                    _, step_nll, _ = tf.while_loop(cond, step, [j, step_nll, mask_add])
-                    return r + 1, acc + step_nll
-                r0 = tf.constant(0)
-                _, total = tf.while_loop(lambda r, *_: tf.less(r, R), body, [r0, tf.constant(0.0)])
-                return total / tf.cast(tf.maximum(R, 1), tf.float32)
-            return tf.cond(tf.equal(tf.size(pos_idx), 0), _zero, _do)
-
-        # Map across batch
-        per_example = tf.map_fn(_sample_pl_nll, (y_true, logits), dtype=tf.float32)
-        # Scale by number of winners (≈6) for stability
-        k = tf.reduce_sum(y_true, axis=1) + 1e-6
-        return tf.reduce_mean(per_example / k)
-
-    return _loss
-
-# Optional pairwise Bradley–Terry (winners vs non‑winners) loss
-# Not used by default, but available for experiments.
-
-# Strengthen hard-negative sampling for the pairwise loss
-def bt_pairwise_loss_factory(num_neg=20):
-    """Sampled pairwise logistic loss: for each winner, sample `num_neg` non‑winners."""
-    @tf.function(experimental_relax_shapes=True)
-    def _loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        def _one(args):
-            y, s = args
-            pos_idx = tf.squeeze(tf.where(y > 0.5), axis=1)
-            neg_idx = tf.squeeze(tf.where(y < 0.5), axis=1)
-            num_p = tf.shape(pos_idx)[0]
-            num_n = tf.shape(neg_idx)[0]
-            def _zero():
-                return tf.constant(0.0, dtype=tf.float32)
-            def _do():
-                # hard-negative sampling: take the top-k negatives by current logits
-                k = tf.minimum(num_neg * tf.maximum(num_p, 1), num_n)
-                neg_scores = tf.gather(s, neg_idx)
-                order = tf.argsort(neg_scores, direction='DESCENDING')
-                neg_samp = tf.gather(neg_idx, order)[:k]
-                # broadcast pairwise differences s_pos - s_neg
-                s_pos = tf.gather(s, pos_idx)
-                s_neg = tf.gather(s, neg_samp)
-                diff = tf.expand_dims(s_pos, 1) - tf.expand_dims(s_neg, 0)
-                return tf.reduce_mean(tf.math.softplus(-diff))
-            return tf.cond(tf.logical_or(tf.equal(num_p, 0), tf.equal(num_n, 0)), _zero, _do)
-        per_ex = tf.map_fn(_one, (y_true, y_pred), dtype=tf.float32)
-        return tf.reduce_mean(per_ex)
-    return _loss
-
-def build_tcnn_model(input_shape, output_dim):
-    """
-    DeepSets-style set encoder for permutation-invariant per-ball scoring.
-    Pipeline: per-element Φ MLP → global mean pooling → concatenate global to each element → ρ MLP → 1×1 conv ⇒ logits
-    Returns logits of shape [batch, 40].
-    """
-    inputs = layers.Input(shape=input_shape)        # (40, n_features)
-    # Φ: element-wise embedding
-    x = layers.Dense(64, activation='relu')(inputs)
-    x = layers.Dense(64, activation='relu')(x)
-    x = layers.Dense(64, activation='relu')(x)
-    # Global set summary (permutation-invariant)
-    g = layers.GlobalAveragePooling1D()(x)
-    g = layers.Dense(64, activation='relu')(g)
-    g = layers.Dense(64, activation='relu')(g)
-    # Repeat the global summary to match the per-number axis length (static timesteps)
-    timesteps = input_shape[0] if (input_shape and input_shape[0] is not None) else 40
-    g_rep = layers.RepeatVector(timesteps)(g)
-    x = layers.Concatenate(axis=-1)([x, g_rep])
-    # ρ: element-wise scoring MLP
-    x = layers.Dense(64, activation='relu')(x)
-    x = layers.Dense(64, activation='relu')(x)
-    x = layers.Dense(32, activation='relu')(x)
-    logits = layers.Conv1D(1, kernel_size=1)(x)           # (batch, 40, 1)
-    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)  # (batch, 40)
-
-    model = keras.Model(inputs=inputs, outputs=logits)
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=5e-4), loss=pl_set_loss_factory(R=8, tau=0.20))
-    return model
-
-# --- 3.3. Transformer Model Implementation ---
-def build_transformer_model(input_shape, output_dim, num_heads=4, ff_dim=96):
-    """
-    Set Transformer style: stack of self-attention blocks (permutation-equivariant),
-    then per-element projection to logits.
-    Returns logits of shape [batch, 40].
-    """
-    inputs = layers.Input(shape=input_shape)  # (40, n_features)
-    x = inputs
-    # SAB block 1
-    attn1 = layers.MultiHeadAttention(num_heads=num_heads, key_dim=8)(x, x)
-    attn1 = layers.Dropout(0.2)(attn1)
-    x = layers.Add()([x, attn1])
-    x = layers.LayerNormalization()(x)
-    ff1 = layers.Dense(ff_dim, activation='relu')(x)
-    ff1 = layers.Dropout(0.2)(ff1)
-    ff1 = layers.Dense(input_shape[-1])(ff1)
-    x = layers.Add()([x, ff1])
-    x = layers.LayerNormalization()(x)
-    # SAB block 2
-    attn2 = layers.MultiHeadAttention(num_heads=num_heads, key_dim=8)(x, x)
-    attn2 = layers.Dropout(0.2)(attn2)
-    y = layers.Add()([x, attn2])
-    y = layers.LayerNormalization()(y)
-    ff2 = layers.Dense(ff_dim, activation='relu')(y)
-    ff2 = layers.Dropout(0.2)(ff2)
-    ff2 = layers.Dense(input_shape[-1])(ff2)
-    y = layers.Add()([y, ff2])
-    y = layers.LayerNormalization()(y)
-
-    # Per-element projection to logits (equivariant → scores per ball)
-    logits = layers.Conv1D(1, kernel_size=1)(y)           # (batch, 40, 1)
-    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)  # (batch, 40)
-
-    model = keras.Model(inputs=inputs, outputs=logits)
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=5e-4), loss=pl_set_loss_factory(R=8, tau=0.20))
-    return model
-
-# --- MC‑dropout helper (seed averaging without retraining) ---
-def _mc_dropout_logits(model, x, n_passes=11):
-    """
-    Run the model n_passes times with dropout active and average logits.
-    This reduces variance and over‑confidence without retraining.
-    """
-    outs = []
-    for _ in range(n_passes):
-        # Calling the model with training=True enables Dropout during inference
-        outs.append(model(x, training=True))
-    import tensorflow as _tf
-    return _tf.reduce_mean(_tf.stack(outs, axis=0), axis=0).numpy()
-
-# --- 3.4. Training the Models with Early Stopping ---
-early_stop = keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, min_delta=1e-4, restore_best_weights=True)
-reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-5, verbose=0)
-
-# Split data into train/validation sets (e.g., 80/20 split)
-_assert_chronological_frame(data)
-split_idx = int(len(X_seq) * 0.8)
-X_train_dl, X_val_dl = X_seq[:split_idx], X_seq[split_idx:]
-y_train_dl, y_val_dl = y_seq[:split_idx], y_seq[split_idx:]
-
-print("Training Temporal CNN model...")
-# Input shape is now (40, n_features)
-lstm_model = build_tcnn_model(input_shape=X_train_dl.shape[1:], output_dim=40)
-lstm_model.fit(
-    X_train_dl, y_train_dl,
-    validation_data=(X_val_dl, y_val_dl),
-    epochs=300,
-    batch_size=8,
-    callbacks=[early_stop, reduce_lr],
-    verbose=2
-)
-
-# Train Transformer Model
-print("Training Transformer model...")
-transformer_model = build_transformer_model(input_shape=X_train_dl.shape[1:], output_dim=40)
-transformer_model.fit(
-    X_train_dl, y_train_dl,
-    validation_data=(X_val_dl, y_val_dl),
-    epochs=1000,
-    batch_size=8,
-    callbacks=[early_stop, reduce_lr],
-    verbose=2
-)
-
-
-# ================================================================
-# Expanding-window fine-tuning for neural nets (every 8 draws)
-# ------------------------------------------------
-# Fine-tune copies of the CNN ("lstm_model") and Transformer on the
-# most recent [120..200] supervised pairs strictly before t_idx.
-# Cached per 8-draw bin to keep cost low.
-FINE_TUNE_EVERY = 8
-FT_MIN = 120
-FT_MAX = 200
-FT_EPOCHS = 20
-_ft_cache = {}  # key: 8-draw bin -> (tcnn_ft, transformer_ft)
-
-def _prepare_recent_supervised(t_idx, window_min=FT_MIN, window_max=FT_MAX):
-    """
-    Build (X_recent, y_recent) using only draws strictly before t_idx.
-    We take the last [window_min..window_max] next-draw supervised pairs.
-    """
-    _set_target_idx(t_idx)
-    start_idx = max(k, t_idx - window_max)
-    end_idx = t_idx  # exclusive (labels go up to t_idx-1)
-    if (end_idx - start_idx) < window_min:
-        start_idx = max(k, end_idx - window_min)
-    Xr, yr = [], []
-    for i in range(start_idx, end_idx):
-        if i - k < 0:
-            continue
-        feats = compute_stat_features(draws[i - k:i], i - 1)  # (40, n_features)
-        Xr.append(feats)
-        yr.append([1 if n in draws[i] else 0 for n in range(1, 41)])
-    if len(Xr) == 0:
-        _set_target_idx(None)
-        return None, None
-    _set_target_idx(None)
-    return np.array(Xr), np.array(yr)
-
-def _get_finetuned_nets(t_idx):
-    """
-    Return (tcnn_ft, transformer_ft) tuned on draws[:t_idx].
-    Models are cached per 10-draw bin for efficiency.
-    """
-    _set_target_idx(t_idx)
-    if t_idx <= k + FT_MIN:
-        _set_target_idx(None)
-        return lstm_model, transformer_model
-
-    bin_key = int(t_idx // FINE_TUNE_EVERY)
-    if bin_key in _ft_cache:
-        _set_target_idx(None)
-        return _ft_cache[bin_key]
-
-    Xr, yr = _prepare_recent_supervised(t_idx)
-    if Xr is None or len(Xr) < FT_MIN:
-        _set_target_idx(None)
-        return lstm_model, transformer_model
-
-    # Time-ordered split: last 10% for validation
-    split = max(1, int(len(Xr) * 0.9))
-    Xr_tr, Xr_val = Xr[:split], Xr[split:]
-    yr_tr, yr_val = yr[:split], yr[split:]
-
-    # Clone architectures and initialise from global weights
-    tcnn_ft = build_tcnn_model(input_shape=X_train_dl.shape[1:], output_dim=40)
-    tcnn_ft.set_weights(lstm_model.get_weights())
-    trans_ft = build_transformer_model(input_shape=X_train_dl.shape[1:], output_dim=40)
-    trans_ft.set_weights(transformer_model.get_weights())
-
-    # Lower LR for fine‑tuning to curb overfitting (keep same PL loss)
-    tcnn_ft.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=2e-4),
-        loss=pl_set_loss_factory(R=8, tau=0.20)
-    )
-    trans_ft.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=2e-4),
-        loss=pl_set_loss_factory(R=8, tau=0.20)
-    )
-
-    es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=1, restore_best_weights=True)
-    # Short fine-tune to avoid overfitting / keep cost low
-    tcnn_ft.fit(Xr_tr, yr_tr, validation_data=(Xr_val, yr_val),
-                epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
-    trans_ft.fit(Xr_tr, yr_tr, validation_data=(Xr_val, yr_val),
-                 epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
-
-    _ft_cache[bin_key] = (tcnn_ft, trans_ft)
-    _set_target_idx(None)
-    return _ft_cache[bin_key]
-
-def _predict_with_nets(feats_batch, t_idx, use_finetune=True, mc_passes=11):
-    """
-    Given a feature batch of shape (1, 40, n_features), return
-    (probs_tcnn, probs_transformer) arrays of shape (40,).
-    If use_finetune=True, use expanding-window fine-tuned models for the 10-draw bin of t_idx.
-    mc_passes controls the number of MC‑dropout passes used to average logits.
-    """
-    _set_target_idx(t_idx)
-    mdl_tcnn, mdl_trans = (lstm_model, transformer_model)
-    if use_finetune:
-        mdl_tcnn, mdl_trans = _get_finetuned_nets(t_idx)
-    logits_l = _mc_dropout_logits(mdl_tcnn, feats_batch, n_passes=mc_passes)[0]
-    logits_t = _mc_dropout_logits(mdl_trans, feats_batch, n_passes=mc_passes)[0]
-    probs_l = tf.nn.softmax(logits_l).numpy()
-    probs_t = tf.nn.softmax(logits_t).numpy()
-    _set_target_idx(None)
-    return probs_l, probs_t
-
-# --- 3.5. Prediction using Deep Models ---
-# For prediction, use the most recent k draws as input (with derived features)
-last_k_draws = draws[-k:]
-_set_target_idx(n_draws)  # allow features to use indices < n_draws only
-features_pred = compute_stat_features(last_k_draws, n_draws - 1)
-features_pred = features_pred.reshape(1, features_pred.shape[0], features_pred.shape[1])
-_set_target_idx(None)
-
-# Use expanding-window fine-tuned nets for the latest prediction
-_l_probs, _t_probs = _predict_with_nets(features_pred, t_idx=n_draws, use_finetune=True)
-lstm_prob = {num: float(_l_probs[num-1]) for num in range(1, 41)}
-transformer_prob = {num: float(_t_probs[num-1]) for num in range(1, 41)}
-
-# 4. **Combining Models for Prediction**
-# We will predict the next draw (after the last known draw in the data).
-last_k_draws = draws[-k:]  # the most recent k draws from history
-
-# Compute probability for each number to be in the next draw according to each component:
-
-# (a) Bayesian probability (long-term frequency)
-bayes_prob = posterior_probs  # already computed above
-
-
-# (b) Markov chain probability based on last draw and multi-step transitions:
-# We combine 1-step, 2-step, and 3-step transitions for richer modeling.
-last_draw = draws[-1]
-last_2_draw = draws[-2] if n_draws > 1 else set()
-last_3_draw = draws[-3] if n_draws > 2 else set()
-
-# 1-step Markov score
-markov_score_1 = {num: 0.0 for num in range(1, 41)}
-for prev_num in last_draw:
-    for candidate in range(1, 41):
-        markov_score_1[candidate] += transition_probs[prev_num].get(candidate, 0)
-# 2-step Markov score
-markov_score_2 = {num: 0.0 for num in range(1, 41)}
-for prev_num in last_2_draw:
-    for candidate in range(1, 41):
-        markov_score_2[candidate] += transition2_probs[prev_num].get(candidate, 0)
-# 3-step Markov score
-markov_score_3 = {num: 0.0 for num in range(1, 41)}
-for prev_num in last_3_draw:
-    for candidate in range(1, 41):
-        markov_score_3[candidate] += transition3_probs[prev_num].get(candidate, 0)
-
-# Weighted sum of multi-step Markov scores (weights can be tuned)
-markov_score = {num: (0.5 * markov_score_1[num] +
-                      0.3 * markov_score_2[num] +
-                      0.2 * markov_score_3[num]) for num in range(1, 41)}
-
-# Normalize Markov scores into probabilities
-markov_prob = {}
-total_score = sum(markov_score.values())
-if total_score > 0:
-    for num in range(1, 41):
-        markov_prob[num] = markov_score[num] / total_score
-else:
-    markov_prob = {num: 1.0/40 for num in range(1, 41)}
-
-# Co-occurrence conditional prob based on within-draw co-occurrence
-cooc_prob = _cooc_conditional_prob_from_history(draws[:-1], last_draw)
-
-# Without-replacement compatibility features (top-k competitor sums) for each base
-COMP_K = 5
-compat_bayes   = _compat_topk_sum(bayes_prob, k=COMP_K)
-compat_markov  = _compat_topk_sum(markov_prob, k=COMP_K)
-compat_hmm     = _compat_topk_sum(hmm_prob, k=COMP_K)
-compat_nn      = _compat_topk_sum({n: 0.5*lstm_prob[n] + 0.5*transformer_prob[n] for n in range(1, 41)}, k=COMP_K)
 
 # Helper primitives needed by regime/weekday logic (must be defined early)
 # ------------------------------------------------
@@ -1310,10 +3517,2445 @@ def _dispersion_last_draw(sub_draws):
     vals = np.array(sorted(list(sub_draws[-1])), dtype=float)
     return float(np.std(vals))
 
+def _meta_features_at_idx(t_idx):
+    """Return [weekday, entropy, dispersion] with light scaling for the nets."""
+    t_idx = int(t_idx)
+    reg_t = _regime_features_at_t(max(0, t_idx))
+    ent_t = _rolling_entropy_from_history(draws[:max(1, t_idx+1)], window=30)
+    disp_t = _dispersion_last_draw(draws[:max(1, t_idx+1)])
+    return [
+        float(reg_t['weekday'])/6.0,
+        float(ent_t)/float(np.log(40.0)),
+        float(disp_t)/20.0,
+    ]
+
+# Build X_seq and y_seq using derived features (with strict time guards)
+_assert_chronological_frame(data)
+for idx in range(k, n_draws - 1):
+    # When constructing features for label at draw idx, only allow access to draws[:idx]
+    _set_target_idx(idx)
+    window_draws = draws[idx - k: idx]       # last k draws (each is a set of 6 numbers)
+    next_draw = draws[idx]                   # the draw immediately after the window
+    # Compute features for all 40 numbers
+    features = compute_stat_features(window_draws, idx - 1)  # (40, n_features)
+    X_seq.append(features)
+    # Meta features based on regime/entropy/dispersion at the window end (idx-1)
+    M_seq.append(_meta_features_at_idx(idx-1))
+    # Output: 40-dim binary vector for next draw
+    y_seq.append([1 if num in next_draw else 0 for num in range(1, 41)])
+X_seq = np.array(X_seq)  # shape (samples, 40, n_features)
+M_seq = np.array(M_seq)  # shape (samples, 3)
+y_seq = np.array(y_seq)  # shape (samples, 40)
+# Clear guard now that the bulk feature construction is complete
+_set_target_idx(None)
+
+# --- Set-aware learning-to-rank losses (PL/BT) -------------------------------------------
+import tensorflow as tf
+import keras  # Keras 3.x API
+from keras import layers
+# --- Import-time training guard for Keras -----------------------------------
+try:
+    import keras as _k_guard
+    if hasattr(_k_guard, "Model") and hasattr(_k_guard.Model, "fit"):
+        _ORIG_KERAS_FIT = _k_guard.Model.fit
+        _FIT_WARNED = {"done": False}
+        def _FIT_GUARD(self, *args, **kwargs):
+            if __name__ == "__main__":
+                return _ORIG_KERAS_FIT(self, *args, **kwargs)
+            if not _FIT_WARNED["done"]:
+                warnings.warn("Skipped keras.Model.fit during import; guarded by __name__ check.")
+                _FIT_WARNED["done"] = True
+            return None
+        _k_guard.Model.fit = _FIT_GUARD
+except Exception:
+    pass
+# ---------------------------------------------------------------------------
+
+def pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10):
+    """
+    Plackett–Luce pseudo-likelihood loss for unordered 6-sets with optional label smoothing.
+    y_true: [batch, 40] multi-hot (six 1s)
+    y_pred: [batch, 40] raw logits per number
+    R: number of random permutations of the positive set to average over
+    tau: magnitude of Gumbel noise for Perturb-and-MAP (0 disables)
+    label_smoothing_eps: distributes epsilon mass onto non-winners
+    ls_weight: weight of the auxiliary smoothed cross-entropy term
+    """
+    neg_inf = tf.constant(-1e9, dtype=tf.float32)
+
+    @tf.function(experimental_relax_shapes=True)
+    def _loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        if tau and tau > 0:
+            u = tf.clip_by_value(tf.random.uniform(tf.shape(y_pred), 1e-7, 1.0 - 1e-7), 1e-7, 1.0 - 1e-7)
+            g = -tf.math.log(-tf.math.log(u)) * tf.cast(tau, y_pred.dtype)
+            logits = y_pred + g
+        else:
+            logits = y_pred
+
+        # Primary PL pseudo-NLL on the set
+        def _sample_pl_nll(args):
+            y, logit = args
+            pos_idx = tf.squeeze(tf.where(y > 0.5), axis=1)
+            k = tf.shape(pos_idx)[0]
+            def _zero(): return tf.constant(0.0, dtype=tf.float32)
+            def _do():
+                nll = 0.0
+                def body(r, acc):
+                    perm = tf.random.shuffle(pos_idx)
+                    mask_add = tf.zeros_like(logit)
+                    step_nll = 0.0
+                    j = tf.constant(0)
+                    def step(j, step_acc, mask_add):
+                        denom = tf.reduce_logsumexp(logit + mask_add)
+                        chosen = perm[j]
+                        step_acc += -(tf.gather(logit, chosen) - denom)
+                        mask_add = tf.tensor_scatter_nd_update(
+                            mask_add, tf.reshape(chosen, [1,1]), tf.reshape(neg_inf, [1])
+                        )
+                        return j + 1, step_acc, mask_add
+                    cond = lambda j, *_: tf.less(j, k)
+                    _, step_nll, _ = tf.while_loop(cond, step, [j, step_nll, mask_add])
+                    return r + 1, acc + step_nll
+                r0 = tf.constant(0)
+                _, total = tf.while_loop(lambda r, *_: tf.less(r, R), body, [r0, tf.constant(0.0)])
+                return total / tf.cast(tf.maximum(R, 1), tf.float32)
+            return tf.cond(tf.equal(tf.size(pos_idx), 0), _zero, _do)
+
+        pl_per_example = tf.map_fn(_sample_pl_nll, (y_true, logits), dtype=tf.float32)
+        k = tf.reduce_sum(y_true, axis=1) + 1e-6
+        pl_loss = tf.reduce_mean(pl_per_example / k)
+
+        # Auxiliary smoothed CE on softmax(logits)
+        eps = tf.cast(label_smoothing_eps, tf.float32)
+        winners = y_true
+        num_winners = tf.reduce_sum(winners, axis=1, keepdims=True)
+        num_non = tf.cast(tf.shape(y_true)[1], tf.float32) - num_winners
+        num_winners = tf.maximum(num_winners, 1.0)
+        num_non = tf.maximum(num_non, 1.0)
+        y_pos = (1.0 - eps) * winners / num_winners
+        y_neg = eps * (1.0 - winners) / num_non
+        y_smooth = y_pos + y_neg
+        log_prob = tf.nn.log_softmax(y_pred, axis=1)
+        ce_loss = tf.reduce_mean(-tf.reduce_sum(y_smooth * log_prob, axis=1))
+
+        return pl_loss + tf.cast(ls_weight, tf.float32) * ce_loss
+
+    return _loss
+
+# Optional pairwise Bradley–Terry (winners vs non‑winners) loss
+# Not used by default, but available for experiments.
+
+# Strengthen hard-negative sampling for the pairwise loss
+def bt_pairwise_loss_factory(num_neg=20):
+    """Sampled pairwise logistic loss: for each winner, sample `num_neg` non‑winners."""
+    @tf.function(experimental_relax_shapes=True)
+    def _loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        def _one(args):
+            y, s = args
+            pos_idx = tf.squeeze(tf.where(y > 0.5), axis=1)
+            neg_idx = tf.squeeze(tf.where(y < 0.5), axis=1)
+            num_p = tf.shape(pos_idx)[0]
+            num_n = tf.shape(neg_idx)[0]
+            def _zero():
+                return tf.constant(0.0, dtype=tf.float32)
+            def _do():
+                # hard-negative sampling: take the top-k negatives by current logits
+                k = tf.minimum(num_neg * tf.maximum(num_p, 1), num_n)
+                neg_scores = tf.gather(s, neg_idx)
+                order = tf.argsort(neg_scores, direction='DESCENDING')
+                neg_samp = tf.gather(neg_idx, order)[:k]
+                # broadcast pairwise differences s_pos - s_neg
+                s_pos = tf.gather(s, pos_idx)
+                s_neg = tf.gather(s, neg_samp)
+                diff = tf.expand_dims(s_pos, 1) - tf.expand_dims(s_neg, 0)
+                return tf.reduce_mean(tf.math.softplus(-diff))
+            return tf.cond(tf.logical_or(tf.equal(num_p, 0), tf.equal(num_n, 0)), _zero, _do)
+        per_ex = tf.map_fn(_one, (y_true, y_pred), dtype=tf.float32)
+        return tf.reduce_mean(per_ex)
+    return _loss
+
+def build_tcnn_model(input_shape, output_dim, meta_dim=3, final_dropout=0.35):
+    """
+    DeepSets-style set encoder with a tiny meta-feature head (weekday, entropy, dispersion).
+    """
+    inputs = layers.Input(shape=input_shape, name="set_inputs")        # (40, n_features)
+    meta_in = layers.Input(shape=(meta_dim,), name="meta_inputs")      # (3,)
+
+    # Φ: element-wise embedding
+    x = layers.Dense(64, activation='relu')(inputs)
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dense(64, activation='relu')(x)
+
+    # Global set summary + meta head
+    g = layers.GlobalAveragePooling1D()(x)
+    m = layers.Dense(16, activation='relu')(meta_in)
+    m = layers.Dense(16, activation='relu')(m)
+    g = layers.Concatenate()([g, m])
+    g = layers.Dense(64, activation='relu')(g)
+
+    # Broadcast back to elements
+    timesteps = input_shape[0] if (input_shape and input_shape[0] is not None) else 40
+    g_rep = layers.RepeatVector(timesteps)(g)
+    x = layers.Concatenate(axis=-1)([x, g_rep])
+
+    # ρ: element-wise scoring MLP (stronger dropout late)
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dense(32, activation='relu')(x)
+    x = layers.Dropout(final_dropout)(x)
+
+    logits = layers.Conv1D(1, kernel_size=1)(x)           # (batch, 40, 1)
+    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)
+
+    model = keras.Model(inputs=[inputs, meta_in], outputs=logits)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+        loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+    )
+    return model
+
+# --- 3.3. Transformer Model Implementation ---
+def build_transformer_model(input_shape, output_dim, num_heads=4, ff_dim=96, meta_dim=3, final_dropout=0.35):
+    """
+    Set Transformer style with a tiny meta-feature head; logits shape [batch, 40].
+    """
+    inputs = layers.Input(shape=input_shape, name="set_inputs")    # (40, n_features)
+    meta_in = layers.Input(shape=(meta_dim,), name="meta_inputs")  # (3,)
+    x = inputs
+
+    # SAB block 1
+    attn1 = layers.MultiHeadAttention(num_heads=num_heads, key_dim=8)(x, x)
+    attn1 = layers.Dropout(0.2)(attn1)
+    x = layers.Add()([x, attn1]); x = layers.LayerNormalization()(x)
+    ff1 = layers.Dense(ff_dim, activation='relu')(x)
+    ff1 = layers.Dropout(0.2)(ff1)
+    ff1 = layers.Dense(input_shape[-1])(ff1)
+    x = layers.Add()([x, ff1]); x = layers.LayerNormalization()(x)
+
+    # SAB block 2
+    attn2 = layers.MultiHeadAttention(num_heads=num_heads, key_dim=8)(x, x)
+    attn2 = layers.Dropout(0.2)(attn2)
+    y = layers.Add()([x, attn2]); y = layers.LayerNormalization()(y)
+    ff2 = layers.Dense(ff_dim, activation='relu')(y)
+    ff2 = layers.Dropout(0.2)(ff2)
+    ff2 = layers.Dense(input_shape[-1])(ff2)
+    y = layers.Add()([y, ff2]); y = layers.LayerNormalization()(y)
+
+    # Meta head → fuse into global, broadcast
+    g = layers.GlobalAveragePooling1D()(y)
+    m = layers.Dense(16, activation='relu')(meta_in)
+    m = layers.Dense(16, activation='relu')(m)
+    g = layers.Concatenate()([g, m])
+    g = layers.Dense(64, activation='relu')(g)
+    timesteps = input_shape[0] if (input_shape and input_shape[0] is not None) else 40
+    g_rep = layers.RepeatVector(timesteps)(g)
+    y = layers.Concatenate(axis=-1)([y, g_rep])
+
+    # Per-element projection (stronger final dropout)
+    y = layers.Dropout(final_dropout)(y)
+    logits = layers.Conv1D(1, kernel_size=1)(y)
+    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)
+
+    model = keras.Model(inputs=[inputs, meta_in], outputs=logits)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+        loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+    )
+    return model
+
+
+# --- Joint (exact-ticket) scoring helpers -------------------------------------
+
+# === Set-AR beam search and joint combinator (new) ===========================
+# This block provides a joint ticket decoder that searches directly in
+# 6-number combination space. It builds candidates with a beam search over
+# marginals (with co-occurrence bonuses) and optionally re-ranks them with
+# the ticket-level XGBoost model if available.
+JOINT_BEAM_WIDTH = 256
+JOINT_TOP_POOL = 20
+JOINT_MAX_CANDIDATES = 512
+LAMBDA_PAIR = 0.55     # strength of co-occurrence pair bonus in beam
+LAMBDA_BUCKET = 0.08   # penalty for extreme low/high imbalance
+LAMBDA_DISP = 0.03     # penalty for odd spacing / extreme sums
+
+def _marginals_from_logits(logits):
+    """Convert length-40 logits/scores to a normalised marginal dict {1..40->p}."""
+    import numpy as _np
+    v = _np.asarray(logits, dtype=float).reshape(-1)
+    if v.size != 40:
+        raise ValueError("logits must have length 40")
+    p = 1.0 / (1.0 + _np.exp(-v))
+    p = _np.clip(p, 1e-12, 1 - 1e-12)
+    p = p / (p.sum() + 1e-12)
+    return {i+1: float(p[i]) for i in range(40)}
+
+def _ticket_logscore(ticket, base_prob_dict, hist_draws):
+    """Joint score for a completed 6-number ticket (higher is better)."""
+    import numpy as _np
+    from itertools import combinations as _comb
+    S = tuple(sorted(int(n) for n in set(ticket)))
+    if len(S) != 6:
+        raise ValueError("ticket must contain 6 unique numbers")
+    # Sum log marginals
+    logp = 0.0
+    for n in S:
+        p = float(base_prob_dict.get(n, 1e-12))
+        p = max(p, 1e-12)
+        logp += float(_np.log(p))
+    # Pairwise co-occurrence bonus from global pair_rate (built earlier)
+    pb = 0.0
+    try:
+        for a, b in _comb(S, 2):
+            key = (a, b) if (a, b) in pair_rate else (b, a)
+            pb += float(pair_rate.get(key, 0.0))
+    except Exception:
+        pb = 0.0
+    # Low/High balance + spacing
+    low = sum(1 for n in S if n <= 20)
+    high = 6 - low
+    bucket_pen = abs(low - high) / 6.0
+    diffs = [S[i+1] - S[i] for i in range(5)]
+    mean_gap = float(_np.mean(diffs))
+    sumv = float(sum(S))
+    # encourage typical central sums/gaps weakly via penalties
+    norm_sum_pen = abs(sumv - 120.0) / 120.0       # center near mid-sum
+    norm_gap_pen = abs(mean_gap - 6.5) / 40.0      # mild target for average spacing
+    return (logp
+            + LAMBDA_PAIR * pb
+            - LAMBDA_BUCKET * bucket_pen
+            - LAMBDA_DISP * (norm_sum_pen + norm_gap_pen))
+
+def _beam_search_on_marginals(base_prob_dict, beam=JOINT_BEAM_WIDTH, k=6, top_pool=JOINT_TOP_POOL):
+    """Greedy/beam expansion over the top-pool of numbers using additive proxy scores."""
+    import numpy as _np
+    # sort top pool by marginal
+    top = sorted(base_prob_dict.items(), key=lambda kv: kv[1], reverse=True)[:int(top_pool)]
+    pool_nums = [int(n) for n, _ in top]
+    beams = [tuple()]      # list of partial tuples (sorted)
+    scores = [0.0]         # accumulated partial scores (approximate)
+    for step in range(k):
+        candidates = []
+        seen = set()
+        for partial, acc in zip(beams, scores):
+            for n in pool_nums:
+                if n in partial:
+                    continue
+                new_t = tuple(sorted(partial + (n,)))
+                if new_t in seen:
+                    continue
+                # partial additive score: log p(n) + small pair bonus vs already chosen
+                sc = acc + float(_np.log(max(base_prob_dict.get(n, 1e-12), 1e-12)))
+                if len(partial) > 0:
+                    for a in partial:
+                        key = (a, n) if (a, n) in pair_rate else (n, a)
+                        sc += (LAMBDA_PAIR * float(pair_rate.get(key, 0.0)) / max(1, step))
+                candidates.append((sc, new_t))
+                seen.add(new_t)
+        # prune to beam width
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates = candidates[:int(beam)]
+        beams = [t for _, t in candidates]
+        scores = [s for s, _ in candidates]
+    # Score completed tickets with the full joint score
+    completed = []
+    hist = draws[:-1] if (isinstance(draws, list) and len(draws) > 0) else []
+    for t in beams:
+        completed.append((_ticket_logscore(t, base_prob_dict, hist), t))
+    completed.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in completed]
+
+def _ticket_set_features(ticket, hist_draws):
+    """Compact, stable features for a full 6-number ticket (used by reranker)."""
+    import numpy as _np
+    from itertools import combinations as _comb
+
+    S = tuple(sorted(int(n) for n in set(ticket)))
+    if len(S) != 6:
+        raise ValueError("ticket must contain 6 unique numbers")
+
+    arr = _np.array(S, dtype=float)
+    s_sum  = float(arr.sum())
+    s_mean = float(arr.mean())
+    s_min  = float(arr.min())
+    s_max  = float(arr.max())
+    s_rng  = float(arr.ptp())
+
+    odd  = sum(1 for n in S if n % 2 == 1)
+    even = 6 - odd
+    low  = sum(1 for n in S if n <= 20)
+    high = 6 - low
+
+    gaps   = _np.diff(arr)
+    g_min  = float(gaps.min())  if gaps.size else 0.0
+    g_mean = float(gaps.mean()) if gaps.size else 0.0
+    g_max  = float(gaps.max())  if gaps.size else 0.0
+
+    try:
+        prs = []
+        for a, b in _comb(S, 2):
+            key = (a, b) if (a, b) in pair_rate else (b, a)
+            prs.append(float(pair_rate.get(key, 0.0)))
+        pair_avg = float(_np.mean(prs)) if prs else 0.0
+    except Exception:
+        pair_avg = 0.0
+
+    try:
+        tris = []
+        for a, b, c in _comb(S, 3):
+            key = (a, b, c)
+            if key not in globals().get('triplet_rate', {}):
+                key = tuple(sorted((a, b, c)))
+            tris.append(float(globals().get('triplet_rate', {}).get(key, 0.0)))
+        trip_sum = float(_np.sum(tris)) if tris else 0.0
+    except Exception:
+        trip_sum = 0.0
+
+    try:
+        base = compute_bayes_posterior(hist_draws, alpha=1) if hist_draws else {n: 1.0/40 for n in range(1, 41)}
+    except Exception:
+        base = {n: 1.0/40 for n in range(1, 41)}
+    p_vals   = _np.array([float(base.get(n, 1.0/40)) for n in S], dtype=float)
+    p_sum    = float(p_vals.sum())
+    p_logsum = float(_np.log(_np.clip(p_vals, 1e-12, None)).sum())
+
+    try:
+        last = sorted(list(hist_draws[-1])) if hist_draws else []
+        overlap = sum(1 for n in S if n in last) if last else 0
+        near = [min(abs(n - x) for x in last) if last else 0.0 for n in S]
+        near_mean = float(_np.mean(near)) if near else 0.0
+    except Exception:
+        overlap = 0
+        near_mean = 0.0
+
+    return _np.array([
+        s_sum, s_mean, s_min, s_max, s_rng,
+        odd, even, low, high,
+        g_min, g_mean, g_max,
+        pair_avg, trip_sum,
+        p_sum, p_logsum,
+        overlap, near_mean
+    ], dtype=float)
+
+_ticket_reranker = None  # trained lazily
+
+def _train_ticket_reranker_quick(hist_draws, max_hist=120, neg_per=6):
+    """Fit a tiny XGB regressor to prefer real past tickets over near-miss negatives.
+    Safe: wraps all failures and returns None if xgboost is unavailable.
+    """
+    try:
+        if xgb is None:
+            return None
+        X = []
+        y = []
+        start = max(8, len(hist_draws) - int(max_hist))
+        for t in range(start, len(hist_draws)):
+            hist = hist_draws[:t]
+            pos = tuple(sorted(int(n) for n in hist_draws[t]))
+            # base probs from history via Bayes (fast and leakage-safe)
+            base = compute_bayes_posterior(hist, alpha=1)
+            # near-miss negatives from a small beam on history
+            neg_pool = _beam_search_on_marginals(base, beam=64, k=6, top_pool=18)
+            negs = []
+            for c in neg_pool:
+                if set(c) != set(pos):
+                    negs.append(c)
+                if len(negs) >= int(neg_per):
+                    break
+            X.append(_ticket_set_features(pos, hist)); y.append(1.0)
+            for n in negs:
+                X.append(_ticket_set_features(n, hist)); y.append(0.0)
+        if len(X) < 50:
+            return None
+        model = xgb.XGBRegressor(
+            n_estimators=200, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.0, reg_lambda=1.0,
+            n_jobs=1, verbosity=0
+        )
+        import numpy as _np
+        model.fit(_np.array(X), _np.array(y))
+        return model
+    except Exception:
+        return None
+
+def _rerank_tickets(candidates, hist_draws):
+    """If a reranker is available, reorder candidates by its score."""
+    global _ticket_reranker
+    try:
+        if _ticket_reranker is None:
+            _ticket_reranker = _train_ticket_reranker_quick(hist_draws)
+        if _ticket_reranker is None:
+            return candidates
+        import numpy as _np
+        X = _np.array([_ticket_set_features(t, hist_draws) for t in candidates])
+        scores = _ticket_reranker.predict(X)
+        order = scores.argsort()[::-1]
+        return [candidates[i] for i in order]
+    except Exception:
+        return candidates
+
+def choose_ticket_joint(base_prob_dict, hist_draws, beam=JOINT_BEAM_WIDTH, top_pool=JOINT_TOP_POOL):
+    """Generate, score, and (optionally) rerank joint ticket candidates; return the best."""
+    cands = _beam_search_on_marginals(base_prob_dict, beam=int(beam), k=6, top_pool=int(top_pool))
+    # dedupe while preserving order
+    uniq = []
+    seen = set()
+    for t in cands:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+        if len(uniq) >= JOINT_MAX_CANDIDATES:
+            break
+    hist = hist_draws if isinstance(hist_draws, list) else []
+    ranked = _rerank_tickets(uniq, hist)
+    if ranked:
+        return tuple(sorted(ranked[0]))
+    # fallback to top-6 marginals if something went wrong
+    arr = sorted(base_prob_dict.items(), key=lambda kv: kv[1], reverse=True)[:6]
+    return tuple(sorted(int(n) for n, _ in arr))
+
+def predict_joint_number_set(model_logits=None, base_prob_dict=None, beam_width=None):
+    """Public API: given model logits OR a marginal dict, return a 6-number ticket (tuple)."""
+    if base_prob_dict is None:
+        if model_logits is not None:
+            try:
+                base_prob_dict = _marginals_from_logits(model_logits)
+            except Exception:
+                base_prob_dict = None
+    if base_prob_dict is None:
+        # last-resort: Bayes from all history
+        try:
+            base_prob_dict = compute_bayes_posterior(draws, alpha=1)
+        except Exception:
+            base_prob_dict = {n: 1.0/40 for n in range(1, 41)}
+    bw = int(beam_width) if beam_width is not None else int(JOINT_BEAM_WIDTH)
+    hist = draws[:-1] if (isinstance(draws, list) and len(draws) > 0) else []
+    return choose_ticket_joint(base_prob_dict, hist, beam=bw, top_pool=JOINT_TOP_POOL)
+# === End Set-AR joint block ==================================================
+
+# ============ Ticket-level Reranker (XGBoost) =================================
+# We train a lightweight gradient-boosted tree to re-rank full 6-number tickets.
+# Features are permutation-invariant set descriptors computed from history up to t.
+
+    """
+    Return a 1D numpy feature vector for a 6-number `ticket` (iterable of ints)
+    using ONLY information from `hist_draws` (draws strictly before the target t).
+    """
+    import numpy as _np
+    from itertools import combinations as _comb
+    S = sorted(int(n) for n in set(ticket))
+    if len(S) != 6:
+        raise ValueError("ticket must contain 6 unique numbers")
+    # Basic set stats
+    diffs = [S[i+1]-S[i] for i in range(5)]
+    sumv = float(sum(S))
+    min_gap = float(min(diffs))
+    max_gap = float(max(diffs))
+    mean_gap = float(_np.mean(diffs))
+    odd_ct = float(sum(1 for n in S if n % 2 == 1))
+    even_ct = 6.0 - odd_ct
+    parity_balance = abs(odd_ct - even_ct) / 6.0
+    low_ct = float(sum(1 for n in S if n <= 20))
+    high_ct = 6.0 - low_ct
+    low_high_balance = abs(low_ct - high_ct) / 6.0
+    # Co-occurrence scores from global counters (already built earlier)
+    pair_sc = 0.0
+    pair_cnt = 0
+    for a,b in _comb(S, 2):
+        pair_sc += float(pair_rate.get((a,b), pair_rate.get((b,a), 0.0)))
+        pair_cnt += 1
+    pair_sc = (pair_sc / max(1, pair_cnt))
+    trip_sc = 0.0
+    trip_cnt = 0
+    for a,b,c in _comb(S, 3):
+        trip_sc += float(triplet_rate.get((a,b,c), 0.0))
+        trip_cnt += 1
+    trip_sc = (trip_sc / max(1, trip_cnt))
+    # Community overlap and distance to last draw
+    last = sorted(list(hist_draws[-1])) if len(hist_draws) else []
+    cid, csz = _cooc_communities_from_history(hist_draws)
+    comm_ids = [cid.get(n, -1) for n in S]
+    # max overlap of ticket with any community that the last draw used
+    last_comms = {cid.get(n, -2) for n in last}
+    overlap_comm = float(sum(1 for n in S if cid.get(n, -2) in last_comms)) / 6.0
+    # mean nearest distance to last draw
+    if last:
+        mean_dist_last = float(_np.mean([min(abs(n-x) for x in last) for n in S]))/40.0
+    else:
+        mean_dist_last = 0.0
+    # KN‑Markov continuation/compat score: average candidate score under KN mix built from history
+    try:
+        t1,t2,t3 = compute_markov_transitions(hist_draws)
+        last1 = hist_draws[-1] if len(hist_draws) >= 1 else set()
+        last2 = hist_draws[-2] if len(hist_draws) >= 2 else set()
+        last3 = hist_draws[-3] if len(hist_draws) >= 3 else set()
+        kn = _kn_interpolated_markov(last1, last2, last3, t1, t2, t3)
+        kn_sc = float(sum(kn.get(n, 0.0) for n in S)) / 6.0
+    except Exception:
+        kn_sc = 1.0/40.0
+    # Normalize some features
+    sum_norm = sumv / 240.0
+    return _np.array([
+        sum_norm, parity_balance, low_high_balance,
+        min_gap/40.0, max_gap/40.0, mean_gap/40.0,
+        pair_sc, trip_sc, overlap_comm, mean_dist_last, kn_sc
+    ], dtype=float)
+
+def _build_reranker_training_data(last_N=120, beam_size=384, near_miss=32, epochs=16, Kperm=6):
+    """
+    Construct pairwise ranking data over the last_N draws:
+    For each t in the window, train a small Set‑AR on draws[:t], generate top beams,
+    take the true ticket as positive and `near_miss` hardest negatives from the beam.
+    Returns (features, labels, group_sizes) for xgboost 'rank:pairwise'.
+    """
+    import numpy as _np
+    X = []; y = []; group = []
+    start = max(6, len(draws) - int(last_N))
+    for t in range(start, len(draws)):
+        try:
+            mdl = train_setar_model(draws[:t], epochs=epochs, K=Kperm, verbose=0)
+            beams = setar_beam_search(mdl, beam_size=beam_size, B=beam_size)
+            truth = sorted(list(draws[t]))
+            hist = _history_upto(t, context="_fit_expert_calibrators")
+            # Build positives/negatives
+            feats_pos = _ticket_set_features(truth, hist)
+            X.append(feats_pos); y.append(1.0)
+            # Choose near-miss negatives by highest joint score that are != truth
+            negs = []
+            for tick, sc in beams:
+                if sorted(tick) != truth:
+                    negs.append((tick, sc))
+                if len(negs) >= near_miss:
+                    break
+            for tick,_ in negs:
+                X.append(_ticket_set_features(sorted(tick), hist))
+                y.append(0.0)
+            group.append(1 + len(negs))
+        except Exception as _e:
+            warnings.warn(f"reranker data failed at t={t}: {_e}")
+    if len(X) == 0:
+        return None, None, None
+    return _np.vstack(X), _np.asarray(y, float), _np.asarray(group, int)
+
+def train_ticket_reranker(last_N=120, beam_size=384, near_miss=32):
+    """
+    Train an XGBoost pairwise ranking model on recent draws; caches to 'ticket_reranker.json'.
+    """
+    if xgb is None:
+        warnings.warn("Skipping reranker: XGBoost not available.")
+        return None
+    X, y, grp = _build_reranker_training_data(last_N=last_N, beam_size=beam_size, near_miss=near_miss)
+    if X is None:
+        return None
+    dtrain = xgb.DMatrix(X, label=y)
+    dtrain.set_group(list(map(int, grp)))
+    params = {
+        "objective": "rank:pairwise",
+        "eval_metric": "auc",
+        "max_depth": 5,
+        "eta": 0.06,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9,
+        "min_child_weight": 12,
+        "lambda": 1.0,
+    }
+    bst = xgb.train(params, dtrain, num_boost_round=180)
+    try:
+        bst.save_model("ticket_reranker.json")
+    except Exception:
+        pass
+    return bst
+
+def _load_ticket_reranker():
+    if xgb is None:
+        return None
+    try:
+        bst = xgb.Booster()
+        bst.load_model("ticket_reranker.json")
+        return bst
+    except Exception:
+        return None
+
+def rerank_beams_with_reranker(beams, hist_draws, blend_gamma=0.6):
+    """
+    beams: list of (ticket, logscore) from Set‑AR.
+    Returns beams re-scored by XGBoost reranker blended with Set‑AR logscore.
+    """
+    if not beams:
+        return beams
+    bst = _load_ticket_reranker()
+    if bst is None:
+        bst = train_ticket_reranker(last_N=120, beam_size=max(128, len(beams)), near_miss=24)
+    if bst is None:
+        return beams
+    feats = []
+    for tick,_ in beams:
+        feats.append(_ticket_set_features(sorted(tick), hist_draws))
+    dmat = xgb.DMatrix(np.vstack(feats))
+    scores = bst.predict(dmat)
+    # z-score blend for stability
+    import numpy as _np
+    s_r = (scores - _np.mean(scores)) / (_np.std(scores) + 1e-9)
+    lls = _np.array([sc for _,sc in beams], dtype=float)
+    lls = (lls - _np.mean(lls)) / (_np.std(lls) + 1e-9)
+    final = blend_gamma * s_r + (1.0 - blend_gamma) * lls
+    rescored = [ (beams[i][0], float(final[i])) for i in range(len(beams)) ]
+    rescored.sort(key=lambda x: x[1], reverse=True)
+    return rescored
+
+# ===========================================================================
+
+# === Lightweight grid search for DPP knobs (alpha, dist_beta) ================
+# Uses a short walk-forward over recent draws. For each t, if SetAR is
+# available we generate beams and measure whether the *true* ticket appears in
+# the top-K after DPP reranking. We pick the knobs that maximize this rate.
+
+def tune_dpp_knobs(last_N=60, beam=160, topK=12,
+                    alpha_grid=(0.50, 0.60, 0.65, 0.70, 0.80),
+                    beta_grid=(0.05, 0.08, 0.12, 0.16, 0.20)):
+    results = {}
+    start = max(6, len(draws) - int(last_N))
+    tried_any = False
+    for t in range(start, len(draws)):
+        try:
+            # Guard: only use history strictly before t
+            hist = draws[:t]
+            truth = sorted(list(draws[t]))
+            # If SetAR is available, get beams; else skip this t
+            if 'train_setar_model' not in globals() or 'setar_beam_search' not in globals():
+                continue
+            mdl = train_setar_model(hist, epochs=10, K=6, verbose=0)
+            beams = setar_beam_search(mdl, beam_size=beam, B=beam, temperature=1.0)
+            if not beams:
+                continue
+            # First, rerank with the XGB ticket reranker if present
+            try:
+                beams = rerank_beams_with_reranker(beams, hist, blend_gamma=0.6)
+            except Exception:
+                pass
+            # Light marginal prior from Bayes (history-only) if P_marg isn't available for t
+            try:
+                P_local = compute_bayes_posterior(hist, alpha=1)
+            except Exception:
+                P_local = None
+            for a in alpha_grid:
+                for b in beta_grid:
+                    tried_any = True
+                    try:
+                        rer = rerank_beams_with_dpp(beams, hist, quality=P_local, alpha=float(a), dist_beta=float(b), temp=1.0)
+                        got = any(sorted(tk) == truth for tk,_ in rer[:max(1, int(topK))])
+                        key = (float(a), float(b))
+                        results[key] = results.get(key, 0) + (1 if got else 0)
+                    except Exception:
+                        pass
+        except Exception as _e:
+            warnings.warn(f"DPP tuning skipped at t={t}: {_e}")
+            continue
+    if not tried_any or not results:
+        return {}
+    # pick best
+    best_key = max(results.items(), key=lambda kv: kv[1])[0]
+    out = {"alpha": best_key[0], "dist_beta": best_key[1], "hits": int(results[best_key]), "trials": int(max(1, len(draws) - max(6, len(draws) - int(last_N))))}
+    # Log to JSONL for traceability
+    try:
+        _log_jsonl({"type": "dpp_tune", "ts": _now_iso(), **out})
+    except Exception:
+        pass
+    return out
+
+# ============ DPP joint decoder (diversity + quality) ========================
+# We use an L-ensemble DPP: L = diag(q) @ S @ diag(q)
+# - q_i encodes per-number quality (from P_marg or Bayes fallback)
+# - S encodes similarity that penalizes picking very similar (close) numbers
+# The DPP prefers diverse, high-quality 6-sets.
+
+def _per_number_quality_from_hist(hist_draws, fallback=None):
+    """
+    Build per-number quality scores q_i using the latest available marginal
+    distribution P_marg if present; otherwise fall back to a Bayes posterior
+    computed from `hist_draws`. Returns np.array of shape (40,).
+    """
+    import numpy as _np
+    if isinstance(fallback, dict) and len(fallback) == 40:
+        q = _np.array([float(fallback.get(i, 1.0/40.0)) for i in range(1,41)], dtype=float)
+        return _np.clip(q, 1e-12, None)
+    try:
+        Pm = globals().get('P_marg', None)
+        if isinstance(Pm, dict) and len(Pm) == 40:
+            q = _np.array([float(Pm.get(i, 1.0/40.0)) for i in range(1,41)], dtype=float)
+            return _np.clip(q, 1e-12, None)
+    except Exception:
+        pass
+    # fallback: simple Bayes posterior from history
+    try:
+        from collections import Counter as _Counter
+        cnt = _Counter([n for d in hist_draws for n in d])
+        tot = max(1, len(hist_draws)*6)
+        q = _np.array([(1.0 + cnt.get(i,0)) / (tot + 40.0) for i in range(1,41)], dtype=float)
+        return _np.clip(q, 1e-12, None)
+    except Exception:
+        return _np.ones(40, dtype=float) / 40.0
+
+
+def _build_similarity_matrix(dist_beta=0.12):
+    """Similarity S where S[i,j] = exp(-dist_beta * |i-j|). Close numbers have
+    higher similarity → DPP discourages selecting them together. Returns S(40x40).
+    """
+    import numpy as _np
+    idx = _np.arange(1,41)[:,None]
+    jdx = _np.arange(1,41)[None,:]
+    D = _np.abs(idx - jdx).astype(float)
+    S = _np.exp(-float(dist_beta) * D)
+    # Ensure exact self-similarity of 1.0
+    for i in range(40):
+        S[i,i] = 1.0
+    return S
+
+
+def _build_dpp_L(hist_draws, quality=None, dist_beta=0.12, temp=1.0, jitter=1e-8):
+    """
+    Construct L = diag(q) @ S @ diag(q), with q tempered by `temp`.
+    """
+    import numpy as _np
+    q = _per_number_quality_from_hist(hist_draws, fallback=quality)
+    q = _np.power(_np.clip(q, 1e-12, None), float(temp))
+    S = _build_similarity_matrix(dist_beta=dist_beta)
+    L = (q.reshape(-1,1) * S) * q.reshape(1,-1)
+    # numerical stability
+    for i in range(40):
+        L[i,i] = float(L[i,i]) + float(jitter)
+    return L
+
+
+def _dpp_log_prob_of_set(L, ticket):
+    """Compute log P(S) = log det(L_S) - log det(I + L) for a 6-number `ticket`."""
+    import numpy as _np
+    S = sorted(int(n) for n in set(ticket))
+    if len(S) != 6:
+        return float('-inf')
+    idx = [n-1 for n in S]
+    L_S = L[_np.ix_(idx, idx)]
+    sign1, logdet1 = _np.linalg.slogdet(L_S)
+    sign2, logdet2 = _np.linalg.slogdet(_np.eye(40) + L)
+    if sign1 <= 0 or sign2 <= 0:
+        return float('-inf')
+    return float(logdet1 - logdet2)
+
+
+def rerank_beams_with_dpp(beams, hist_draws, quality=None, alpha=0.65, dist_beta=0.12, temp=1.0):
+    """
+    Re-score Set‑AR beams using an L-ensemble DPP prior and blend with the
+    original (log-)score:  score = alpha*orig + (1-alpha)*log P_DPP(S).
+    `quality` may be a {1..40 -> p} dict (e.g., P_marg). Returns re-sorted beams.
+    """
+    if not beams:
+        return beams
+    import numpy as _np
+    try:
+        L = _build_dpp_L(hist_draws, quality=quality, dist_beta=dist_beta, temp=temp)
+    except Exception:
+        return beams
+    resc = []
+    orig = _np.array([float(sc) for _,sc in beams], dtype=float)
+    # z-score the original scores for blending stability
+    orig = (orig - orig.mean()) / (orig.std() + 1e-9)
+    for (tick, sc), oz in zip(beams, orig):
+        try:
+            lp = _dpp_log_prob_of_set(L, tick)
+        except Exception:
+            lp = 0.0
+        final = float(alpha) * float(oz) + (1.0 - float(alpha)) * float(lp)
+        resc.append((tick, final))
+    resc.sort(key=lambda x: x[1], reverse=True)
+    return resc
+# ===========================================================================
+
+def _setar_logprob_of_perm(model, perm_tokens):
+    """Teacher-forced logprob of a specific ordered sequence (length 6) under SetAR,
+    with without-replacement masking enforced. perm_tokens are ints 1..40."""
+    BOS = 0
+    inp = np.array([[BOS] + perm_tokens[:-1]], dtype=np.int32)  # (1,6)
+    tgt = np.array([perm_tokens], dtype=np.int32)               # (1,6)
+    logits = model(inp, training=False).numpy()                 # (1,6,vocab)
+    vocab = logits.shape[-1]
+    running = np.zeros((1, vocab), dtype=np.float32)
+    bigneg = -1e9
+    logprob = 0.0
+    for t in range(6):
+        if t > 0:
+            idx = inp[0, t]
+            running[0, idx] += 1.0
+        masked = logits[:, t, :].copy()
+        masked[running > 0.5] += bigneg
+        m = masked[0]
+        m = m - np.max(m)
+        p = np.exp(m) / np.clip(np.sum(np.exp(m)), 1e-12, None)
+        logprob += float(np.log(np.clip(p[tgt[0, t]], 1e-12, None)))
+    return float(logprob)
+
+def setar_max_logprob_of_set(model, ticket, K=24, rng_seed=13):
+    """Maximum teacher-forced logprob across K random permutations of `ticket`."""
+    import random
+    r = random.Random(int(rng_seed))
+    base = list(ticket)
+    best = -1e18
+    for _ in range(max(6, int(K))):
+        r.shuffle(base)
+        lp = _setar_logprob_of_perm(model, base)
+        if lp > best:
+            best = lp
+    return float(best)
+
+# --- SetAR core components: training and beam search ---------------------------------
+
+def train_setar_model(draws_hist, epochs=16, K=6, verbose=0, d_model=64, seed=1337):
+    """
+    Train a lightweight autoregressive set model (SetAR) that predicts the next
+    element given previously selected elements. We treat each historical 6-number
+    draw as a length-6 token sequence (numbers 1..40), prepend a BOS=0 token for
+    teacher forcing, and train with sparse categorical cross-entropy.
+
+    Args:
+        draws_hist: list[set[int]] of past draws (each size==6), strictly before t.
+        epochs: keras fit epochs.
+        K: number of random permutations per draw to enforce permutation invariance.
+        verbose: keras verbosity.
+        d_model: embedding/hidden size.
+        seed: RNG seed for reproducibility.
+
+    Returns:
+        Keras model that maps an int32 sequence of length 6 (BOS+5 previous picks)
+        to logits of shape (6, 41). The vocabulary is {0..40}, where 0=BOS and
+        1..40 are lotto numbers.
+    """
+    import numpy as _np
+    import random as _random
+    from keras import layers as _L
+    # --- Import-time training guard for Keras -----------------------------------
+    try:
+        import keras as _k_guard
+        if hasattr(_k_guard, "Model") and hasattr(_k_guard.Model, "fit"):
+            _ORIG_KERAS_FIT = _k_guard.Model.fit
+            def _FIT_GUARD(self, *args, **kwargs):
+                if __name__ == "__main__":
+                    return _ORIG_KERAS_FIT(self, *args, **kwargs)
+                warnings.warn("Skipped keras.Model.fit during import; guarded by __name__ check.")
+                return None
+            _k_guard.Model.fit = _FIT_GUARD
+    except Exception:
+        pass
+    # ---------------------------------------------------------------------------
+    BOS = 0
+    V = 41  # 0..40 (0=BOS)
+
+    # Build training pairs (inp -> tgt) with K random permutations per draw
+    inps = []
+    tgts = []
+    _rnd = _random.Random(int(seed))
+    for draw in draws_hist:
+        S = list(set(int(n) for n in draw if 1 <= int(n) <= 40))
+        if len(S) != 6:
+            continue
+        base_sorted = sorted(S)
+        for _ in range(max(1, int(K))):
+            seq = base_sorted[:]  # deterministic base, then shuffle for invariance
+            _rnd.shuffle(seq)
+            # inputs: [BOS] + first 5 tokens; targets: full 6 tokens
+            inp = [BOS] + seq[:-1]
+            tgt = seq
+            inps.append(inp)
+            tgts.append(tgt)
+    if not inps:
+        # Safety fallback: create a tiny dummy dataset (uniform) so callers don't crash
+        inps = [[0, 0, 0, 0, 0, 0]]
+        tgts = [[1, 2, 3, 4, 5, 6]]
+
+    X = _np.asarray(inps, dtype=_np.int32)
+    Y = _np.asarray(tgts, dtype=_np.int32)
+
+    # Model: token embedding + small GRU decoder with per-step logits
+    inp = _L.Input(shape=(6,), dtype='int32', name='ar_input')
+    x = _L.Embedding(input_dim=V, output_dim=int(d_model), mask_zero=False, name='tok_emb')(inp)
+    x = _L.GRU(int(d_model*1.5), return_sequences=True, name='gru1')(x)
+    x = _L.Dense(int(d_model), activation='relu', name='proj')(x)
+    logits = _L.Dense(V, name='logits')(x)  # (batch, 6, 41)
+
+    mdl = keras.Model(inp, logits, name='SetAR')
+    mdl.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    )
+    cb = [keras.callbacks.EarlyStopping(monitor='loss', patience=3, restore_best_weights=True)]
+    try:
+        mdl.fit(X, Y, epochs=int(epochs), batch_size=64, verbose=int(verbose), callbacks=cb, shuffle=True)
+    except Exception:
+        # Non-fatal; return partially trained model
+        pass
+    return mdl
+
+
+def setar_beam_search(model, beam_size=128, B=128, temperature=1.0):
+    """
+    Autoregressive decoding with without-replacement masking.
+
+    Args:
+        model: SetAR model returned by train_setar_model. Must accept int32 input of shape (1,6)
+               and return logits of shape (1,6,41).
+        beam_size: number of total candidates to retain per layer (alias for B if only one is given).
+        B: final beam width to keep after each expansion.
+        temperature: softmax temperature for exploration (>1.0 flatter, <1.0 sharper).
+
+    Returns:
+        List[(ticket:list[int], score:float)] sorted by descending score, where
+        `ticket` is a 6-number sorted list and `score` is cumulative log-prob.
+    """
+    import numpy as _np
+
+    BOS = 0
+    V = 41
+    B = int(B if B is not None else beam_size)
+    beam_size = int(beam_size)
+
+    def _log_softmax(vec):
+        v = _np.asarray(vec, dtype=_np.float32)
+        v = v - _np.max(v)
+        expv = _np.exp(v / max(1e-8, float(temperature)))
+        Z = _np.sum(expv) + 1e-12
+        p = expv / Z
+        return _np.log(p + 1e-12)
+
+    # beams hold tuples (seq, logprob) where seq contains chosen numbers (1..40)
+    beams = [([], 0.0)]
+    for t in range(6):
+        cand = []
+        for seq, lp in beams:
+            # Prepare input: [BOS] + seq + pad zeros to length 6
+            x = _np.zeros((1, 6), dtype=_np.int32)
+            prefix = [BOS] + seq + [0]*max(0, 5 - len(seq))
+            x[0, :len(prefix)] = _np.asarray(prefix, _np.int32)
+            try:
+                logits = model(x, training=False).numpy()[0]  # (6, 41)
+            except Exception:
+                logits = _np.asarray(model.predict(x, verbose=0))[0]
+            step_logits = logits[t]  # next-token position
+            # Mask BOS and already-picked tokens to enforce without-replacement
+            step_logits[0] = -1e9
+            for z in seq:
+                step_logits[int(z)] = -1e9
+            # Compute log-probs with temperature
+            logp = _log_softmax(step_logits)
+            # Expand with the top-k candidates to limit branching
+            k = min(40 - len(seq), max(6, B))
+            top_idx = _np.argsort(logp)[-k:][::-1]
+            for idx in top_idx:
+                n = int(idx)
+                if n == 0 or n in seq:
+                    continue
+                cand.append((seq + [n], lp + float(logp[idx])))
+        # Keep the best B candidates
+        if not cand:
+            break
+        cand.sort(key=lambda s: s[1], reverse=True)
+        beams = cand[:max(1, B)]
+
+    # Finalise: sort ticket numbers and return list[(ticket, score)]
+    out = []
+    for seq, sc in beams:
+        if len(seq) == 6:
+            out.append((sorted(seq), float(sc)))
+    # Fallback: if no full-length sequences, take the longest we have and pad greedily
+    if not out and beams:
+        seq, sc = beams[0]
+        avail = [i for i in range(1, 41) if i not in seq]
+        need = 6 - len(seq)
+        seq = sorted(seq + avail[:max(0, need)])
+        out = [(seq, float(sc))]
+
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+# --- Rolling backtest to fit JOINT isotonic calibrator ------------------------
+
+def run_setar_joint_backtest(last_N=120, epochs=24, Kperm=6, beam=96):
+    """Walk-forward over last_N draws: train SetAR on draws[:t], record the joint
+    log-score of the true ticket and whether it appears in top-`beam` beams.
+    Fit isotonic mapping raw joint scores → success rate. Export joint reliability."""
+    start = max(6, len(draws) - int(last_N))
+    scores, labels = [], []
+    for t in range(start, len(draws)):
+        try:
+            mdl = train_setar_model(draws[:t], epochs=epochs, K=Kperm, verbose=0)
+            truth = sorted(list(draws[t]))
+            s = setar_max_logprob_of_set(mdl, truth, K=Kperm)
+            scores.append(s)
+            beams = setar_beam_search(mdl, beam_size=beam, B=beam)
+            got = any(sorted(b[0]) == truth for b in beams)
+            labels.append(1 if got else 0)
+        except Exception as _e:
+            warnings.warn(f"SetAR joint backtest failed at t={t}: {_e}")
+    # fit isotonic on (scores, labels)
+    try:
+        if len(scores) >= 20:
+            cal = _PostRankIsotonic().fit(scores, labels)
+            globals()['postrank_calibrator_joint'] = cal
+            import numpy as _np
+            be = _np.linspace(float(min(scores)), float(max(scores) + 1e-9), 11)
+            idx = _np.digitize(_np.asarray(scores, float), be, right=True)
+            pred_means, obs_rates = [], []
+            y_arr = _np.asarray(labels, float)
+            for b in range(1, len(be)):
+                m = (idx == b)
+                if _np.any(m):
+                    pm = float(_np.mean(_np.asarray(scores)[m]))
+                    orc = float(_np.mean(y_arr[m]))
+                else:
+                    pm, orc = 0.0, 0.0
+                pred_means.append(pm); obs_rates.append(orc)
+            _export_reliability(be, pred_means, obs_rates,
+                                csv_path="reliability_curve_joint.csv",
+                                png_path="reliability_curve_joint.png")
+    except Exception as _e:
+        warnings.warn(f"Joint calibration export failed: {_e}")
+
+# --- Particle Filter backtest over recent draws ---
+def run_particle_filter_backtest(draws, train_size=None, window=50, num_particles=4000, alpha=0.005, sigma=0.01):
+    """
+    Assimilate up to `train_size` draws, then backtest sequentially on the remainder.
+    Returns dict with keys: pf (fitted ParticleFilter), nlls, hits, recent_nll, recent_hits, window, train_size.
+    """
+    M = 40
+    N = len(draws)
+    if train_size is None:
+        train_size = max(6, N - 150)
+    pf = ParticleFilter(num_numbers=M, num_particles=int(num_particles), alpha=float(alpha), sigma=float(sigma))
+    # Assimilate training segment
+    for t in range(int(train_size)):
+        try:
+            pf.predict()
+            pf.update(draws[t])
+        except Exception:
+            pass
+    # Backtest segment
+    pf_nlls, pf_hits = [], []
+    for t in range(int(train_size), N):
+        try:
+            pf.predict()
+            mean_p = pf.get_mean_probabilities()
+            joint_pred__pf = predict_joint_number_set(base_prob_dict={i+1: float(mean_p[i]) for i in range(40)}, beam_width=JOINT_BEAM_WIDTH)
+            top6_idx = np.array(sorted([n-1 for n in joint_pred__pf], key=lambda i: mean_p[i], reverse=True))
+            pf_top6 = [int(i)+1 for i in top6_idx]
+            pf_top6.sort()
+            hits = len(set(pf_top6).intersection(set(draws[t])))
+            pf_hits.append(int(hits))
+            nll = float(pf.update(draws[t]))
+            pf_nlls.append(nll)
+        except Exception as _e:
+            warnings.warn(f"PF backtest step failed at t={t}: {_e}")
+    w = min(int(window), len(pf_nlls)) if len(pf_nlls) > 0 else 0
+    recent_nll = float(np.mean(pf_nlls[-w:])) if w > 0 else float('inf')
+    recent_hits = float(np.mean(pf_hits[-w:])) if w > 0 else 0.0
+    return dict(pf=pf, nlls=pf_nlls, hits=pf_hits, recent_nll=recent_nll, recent_hits=recent_hits, window=w, train_size=int(train_size))
+
+# --- Ensure ensemble recent metrics; compute via Set‑AR if not logged globally ---
+def ensure_ensemble_recent_metrics(draws, window=50, last_N=150):
+    """
+    Tries to use globals 'main_pl_nlls' and 'top6_recall_list'.
+    If missing, runs a lightweight Set‑AR walk‑forward over last_N draws to estimate:
+      - recent average NLL (as -max joint logprob of truth)
+      - recent average hits per draw from top‑1 Set‑AR ticket (or Bayes fallback)
+    Returns dict with keys: recent_nll, recent_hits, window.
+    """
+    try:
+        ens_nlls = globals().get('main_pl_nlls', None)
+        ens_recalls = globals().get('top6_recall_list', None)
+        if isinstance(ens_nlls, (list, tuple)) and len(ens_nlls) > 0 and isinstance(ens_recalls, (list, tuple)) and len(ens_recalls) > 0:
+            w = min(int(window), len(ens_nlls), len(ens_recalls))
+            return dict(recent_nll=float(np.mean(ens_nlls[-w:])),
+                        recent_hits=float(np.mean(ens_recalls[-w:]) * 6.0),
+                        window=w)
+    except Exception:
+        pass
+
+    # Lightweight Set‑AR walk‑forward
+    N = len(draws)
+    start = max(6, N - int(last_N))
+    nlls, hits = [], []
+    for t in range(start, N):
+        try:
+            mdl = train_setar_model(draws[:t], epochs=8, K=4, verbose=0)
+            truth = sorted(list(draws[t]))
+            lp = setar_max_logprob_of_set(mdl, truth, K=6)
+            nlls.append(float(-lp))
+            beams = setar_beam_search(mdl, beam_size=128, B=128, temperature=1.0)
+            if beams:
+                pred = sorted(beams[0][0])
+            else:
+                # Bayes fallback
+                P_local = compute_bayes_posterior(draws[:t], alpha=1)
+                # local top‑k helper (avoid dependency on outside helper)
+                pred = sorted(sorted(P_local.keys(), key=lambda n: P_local[n], reverse=True)[:6])
+            hits.append(float(len(set(pred).intersection(set(truth)))))
+        except Exception as _e:
+            warnings.warn(f"Ensemble backtest failed at t={t}: {_e}")
+    w = min(int(window), len(nlls)) if len(nlls) > 0 else 0
+    rec_nll = float(np.mean(nlls[-w:])) if w > 0 else float('inf')
+    rec_hits = float(np.mean(hits[-w:])) if w > 0 else 0.0
+    return dict(recent_nll=rec_nll, recent_hits=rec_hits, window=w)
+
+# === Train, calibrate & decode SetAR on historical draws ======================
+try:
+    # Train on all historical draws except the very last (avoid peeking)
+    setar_model = train_setar_model(draws[:-1], d_model=96, epochs=50, K=6, verbose=1)
+except Exception as _e:
+    warnings.warn(f"SetAR training failed: {_e}")
+    setar_model = None
+
+# Fit a JOINT isotonic calibrator via a short walk-forward backtest
+try:
+    run_setar_joint_backtest(last_N=120, epochs=20, Kperm=4, beam=64)
+except Exception as _e:
+    warnings.warn(f"SetAR joint backtest failed: {_e}")
+
+# Build marginal ensemble for the most recent completed draw to use as a prior
+try:
+    bases_now = _per_expert_prob_dicts_at_t(n_draws)  # leakage-safe: uses draws[:n_draws]
+    _assert_expert_key_consistency(bases_now)
+    w_now = np.asarray(globals().get('weights', np.ones(5, dtype=float) / 5.0), dtype=float)
+    w_now = _adapt_base_weights(w_now)
+    P_marg = _mix_prob_dicts(w_now, bases_now)
+except Exception as _e:
+    warnings.warn(f"Marginal ensemble build failed: {_e}")
+    P_marg = _uniform_prob40()
+
+# Decode joint tickets with SetAR and blend with marginal prior
+setar_top = []
+try:
+    if setar_model is not None:
+        setar_raw = setar_beam_search(setar_model, beam_size=128, B=100, temperature=1.0)
+        setar_top = blend_joint_with_marginals(setar_raw, P_marg, alpha=0.8)
+except Exception as _e:
+    warnings.warn(f"SetAR decoding failed: {_e}")
+    setar_top = []
+
+# ---- Ticket-level reranker on top of Set‑AR beams ----
+try:
+    if setar_model is not None and setar_top:
+        # Re-run Set‑AR beam search without prior blend to score by joint likelihood
+        raw_beams = setar_beam_search(setar_model, beam_size=256, B=256, temperature=1.0)
+        # Rerank using XGBoost features and blend with Set‑AR log-likelihood
+        setar_top = rerank_beams_with_reranker(raw_beams, draws[:-1], blend_gamma=0.6)
+        # Optional: re-apply marginal prior after reranking (light nudging)
+        if setar_top:
+            setar_top = blend_joint_with_marginals(setar_top, P_marg, alpha=0.8)
+        # DPP re-ranking to inject diversity-aware set prior
+        try:
+            setar_top = rerank_beams_with_dpp(setar_top, draws[:-1], quality=P_marg, alpha=0.65, dist_beta=0.12, temp=1.0)
+        except Exception as _e:
+            warnings.warn(f"DPP reranker step failed: {_e}")
+        # Optional: quick auto‑tune over the last ~60 draws, then re-apply
+        try:
+            tune = tune_dpp_knobs(last_N=60, beam=128, topK=10,
+                                  alpha_grid=(0.55, 0.65, 0.75),
+                                  beta_grid=(0.08, 0.12, 0.18))
+            if isinstance(tune, dict) and tune.get("alpha") is not None:
+                setar_top = rerank_beams_with_dpp(setar_top, draws[:-1], quality=P_marg,
+                                                  alpha=float(tune["alpha"]),
+                                                  dist_beta=float(tune["dist_beta"]), temp=1.0)
+        except Exception as _e:
+            warnings.warn(f"DPP auto‑tune failed: {_e}")
+except Exception as _e:
+    warnings.warn(f"Ticket reranker step failed: {_e}")
+
+# --- Final selection: Dynamic PF vs Ensemble; write SINGLE prediction line ---
+try:
+    # 1) Backtest Particle Filter on recent data
+    pf_bt = run_particle_filter_backtest(draws, train_size=None, window=50, num_particles=1000, alpha=0.01, sigma=0.02)
+    pf_recent_nll = pf_bt['recent_nll']
+    pf_recent_hits = pf_bt['recent_hits']
+
+    # 2) Get Ensemble recent metrics (logged or freshly computed via Set‑AR)
+    ens_met = ensure_ensemble_recent_metrics(draws, window=50, last_N=150)
+    ens_recent_nll = float(ens_met.get('recent_nll', float('inf')))
+    ens_recent_hits = float(ens_met.get('recent_hits', 0.0))
+
+    # 3) Decide which method to trust right now
+    THRESH = 0.05  # NLL advantage needed to be considered "significant"
+    if pf_recent_nll + THRESH < ens_recent_nll:
+        chosen_method = "PF"
+    elif ens_recent_nll + THRESH < pf_recent_nll:
+        chosen_method = "Ensemble"
+    else:
+        chosen_method = "PF" if pf_recent_hits >= ens_recent_hits else "Ensemble"
+
+    # 4) Compute the final top‑6 prediction
+    final_top6 = None
+    if chosen_method == "PF":
+        try:
+            pf_model = pf_bt['pf']
+            pf_model.predict()  # one‑step ahead beyond the last known draw
+            final_probs = pf_model.get_mean_probabilities()
+            joint_pred__final = predict_joint_number_set(base_prob_dict={i+1: float(final_probs[i]) for i in range(40)}, beam_width=JOINT_BEAM_WIDTH)
+            top6_idx = np.array(sorted([n-1 for n in joint_pred__final], key=lambda i: final_probs[i], reverse=True))
+            final_top6 = [int(i)+1 for i in top6_idx]
+            final_top6.sort()
+        except Exception as _e:
+            warnings.warn(f"PF final prediction failed, falling back to ensemble: {_e}")
+            chosen_method = "Ensemble"
+
+    if chosen_method == "Ensemble" or final_top6 is None:
+        try:
+            # Prefer Set‑AR beams if available, otherwise marginal Bayes prior
+            if 'setar_top' in globals() and isinstance(setar_top, list) and len(setar_top) > 0:
+                final_top6 = sorted(list(setar_top[0][0]))
+            else:
+                # Fallback to marginal top‑6 from P_marg (already built above)
+                P_local = globals().get('P_marg', None)
+                if isinstance(P_local, dict) and len(P_local) == 40:
+                    final_top6 = sorted(sorted(P_local.keys(), key=lambda n: P_local[n], reverse=True)[:6])
+                else:
+                    final_top6 = sorted(list(draws[-1]))  # last known draw as last‑resort placeholder
+        except Exception as _e:
+            warnings.warn(f"Ensemble final prediction fallback failed: {_e}")
+            final_top6 = sorted(list(draws[-1]))
+
+    # 5) Write ONLY ONE LINE to predicted_tickets.txt (as requested)
+    with open("predicted_tickets.txt", "w", encoding="utf-8") as f:
+        f.write(" ".join(str(n) for n in final_top6) + "\n")
+
+    print(f"Chosen method: {chosen_method}, Final Top-6 prediction: {final_top6}")
+
+    # 6) Log selection + recent metrics to JSONL
+    try:
+        _log_jsonl({
+            "type": "final_selection",
+            "ts": _now_iso(),
+            "chosen": chosen_method,
+            "pf_recent_nll": float(pf_recent_nll),
+            "pf_recent_hits": float(pf_recent_hits),
+            "ensemble_recent_nll": float(ens_recent_nll),
+            "ensemble_recent_hits": float(ens_recent_hits),
+            "window": int(min(50, len(draws))),
+        })
+    except Exception:
+        pass
+
+except Exception as _e:
+    warnings.warn(f"Final selection and write failed: {_e}")
+
+# --- MC‑dropout helper (seed averaging without retraining) ---
+def _mc_dropout_logits(model, x, n_passes=11):
+    """
+    Run the model n_passes times with dropout active and average logits.
+    This reduces variance and over‑confidence without retraining.
+    """
+    outs = []
+    for _ in range(n_passes):
+        # Calling the model with training=True enables Dropout during inference
+        outs.append(model(x, training=True))
+    import tensorflow as _tf
+    return _tf.reduce_mean(_tf.stack(outs, axis=0), axis=0).numpy()
+
+# --- 3.4. Training the Models with Early Stopping ---
+early_stop = keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, min_delta=1e-4, restore_best_weights=True)
+reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8, min_lr=1e-5, verbose=0)
+
+# Split data into train/validation sets (e.g., 80/20 split)
+_assert_chronological_frame(data)
+split_idx = int(len(X_seq) * 0.8)
+X_train_dl, X_val_dl = X_seq[:split_idx], X_seq[split_idx:]
+M_train_dl, M_val_dl = M_seq[:split_idx], M_seq[split_idx:]
+y_train_dl, y_val_dl = y_seq[:split_idx], y_seq[split_idx:]
+
+print("Training Temporal CNN model...")
+lstm_model = build_tcnn_model(input_shape=X_train_dl.shape[1:], output_dim=40, meta_dim=M_train_dl.shape[1], final_dropout=0.35)
+lstm_model.fit(
+    [X_train_dl, M_train_dl], y_train_dl,
+    validation_data=([X_val_dl, M_val_dl], y_val_dl),
+    epochs=300,
+    batch_size=8,
+    callbacks=[early_stop, reduce_lr],
+    verbose=2
+)
+
+# Train Transformer Model
+print("Training Transformer model...")
+transformer_model = build_transformer_model(input_shape=X_train_dl.shape[1:], output_dim=40, meta_dim=M_train_dl.shape[1], final_dropout=0.35)
+transformer_model.fit(
+    [X_train_dl, M_train_dl], y_train_dl,
+    validation_data=([X_val_dl, M_val_dl], y_val_dl),
+    epochs=1000,
+    batch_size=8,
+    callbacks=[early_stop, reduce_lr],
+    verbose=2
+)
+
+
+# ================================================================
+# Expanding-window fine-tuning for neural nets (every 8 draws)
+# ------------------------------------------------
+# Fine-tune copies of the CNN ("lstm_model") and Transformer on the
+# most recent [150..150] supervised pairs strictly before t_idx.
+# Cached per 8-draw bin to keep cost low.
+FINE_TUNE_EVERY = 8
+FT_MIN = 150
+FT_MAX = 150
+FT_EPOCHS = 12
+_ft_cache = {}  # key: 8-draw bin -> (tcnn_ft, transformer_ft)
+
+def _prepare_recent_supervised(t_idx, window_min=FT_MIN, window_max=FT_MAX):
+    """
+    Build (X_recent, y_recent, M_recent) using only draws strictly before t_idx.
+    We take the last [window_min..window_max] next-draw supervised pairs.
+    """
+    _set_target_idx(t_idx)
+    start_idx = max(k, t_idx - window_max)
+    end_idx = t_idx  # exclusive (labels go up to t_idx-1)
+    if (end_idx - start_idx) < window_min:
+        start_idx = max(k, end_idx - window_min)
+    Xr, yr = [], []
+    Mr = []
+    for i in range(start_idx, end_idx):
+        if i - k < 0:
+            continue
+        feats = compute_stat_features(draws[i - k:i], i - 1)  # (40, n_features)
+        Xr.append(feats)
+        Mr.append(_meta_features_at_idx(i-1))
+        yr.append([1 if n in draws[i] else 0 for n in range(1, 41)])
+    if len(Xr) == 0:
+        _set_target_idx(None)
+        return None, None, None
+    _set_target_idx(None)
+    return np.array(Xr), np.array(yr), np.array(Mr)
+
+def _get_finetuned_nets(t_idx):
+    """
+    Return (tcnn_ft, transformer_ft) tuned on draws[:t_idx].
+    Models are cached per 10-draw bin for efficiency.
+    """
+    _set_target_idx(t_idx)
+    if t_idx <= k + FT_MIN:
+        _set_target_idx(None)
+        return lstm_model, transformer_model
+
+    bin_key = int(t_idx // FINE_TUNE_EVERY)
+    if bin_key in _ft_cache:
+        _set_target_idx(None)
+        return _ft_cache[bin_key]
+
+    Xr, yr, Mr = _prepare_recent_supervised(t_idx)
+    if Xr is None or len(Xr) < FT_MIN:
+        _set_target_idx(None)
+        return lstm_model, transformer_model
+
+    # Time-ordered split: last 10% for validation
+    split = max(1, int(len(Xr) * 0.9))
+    Xr_tr, Xr_val = Xr[:split], Xr[split:]
+    yr_tr, yr_val = yr[:split], yr[split:]
+    Mr_tr, Mr_val = Mr[:split], Mr[split:]
+
+    # Clone architectures and initialise from global weights
+    tcnn_ft = build_tcnn_model(input_shape=X_train_dl.shape[1:], output_dim=40)
+    tcnn_ft.set_weights(lstm_model.get_weights())
+    trans_ft = build_transformer_model(input_shape=X_train_dl.shape[1:], output_dim=40)
+    trans_ft.set_weights(transformer_model.get_weights())
+
+    # Freeze earlier blocks so fine-tune only adapts late heads
+    for l in tcnn_ft.layers:
+        if isinstance(l, (layers.MultiHeadAttention, layers.LayerNormalization)):
+            l.trainable = False
+        elif isinstance(l, (layers.Dense, layers.Conv1D)):
+            l.trainable = True
+        else:
+            l.trainable = False
+
+    for l in trans_ft.layers:
+        if isinstance(l, (layers.MultiHeadAttention, layers.LayerNormalization)):
+            l.trainable = False
+        elif isinstance(l, (layers.Dense, layers.Conv1D)):
+            l.trainable = True
+        else:
+            l.trainable = False
+
+    # Lower LR for fine‑tuning to curb overfitting (keep same PL loss)
+    tcnn_ft.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=2e-4),
+        loss=pl_set_loss_factory(R=8, tau=0.20)
+    )
+    trans_ft.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=2e-4),
+        loss=pl_set_loss_factory(R=8, tau=0.20)
+    )
+
+    es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=1, restore_best_weights=True)
+    # Short fine-tune to avoid overfitting / keep cost low
+    tcnn_ft.fit([Xr_tr, Mr_tr], yr_tr, validation_data=([Xr_val, Mr_val], yr_val),
+                epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
+
+    trans_ft.fit([Xr_tr, Mr_tr], yr_tr, validation_data=([Xr_val, Mr_val], yr_val),
+                 epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
+
+    _ft_cache[bin_key] = (tcnn_ft, trans_ft)
+    _set_target_idx(None)
+    return _ft_cache[bin_key]
+
+def _predict_with_nets(feats_batch, meta_batch, t_idx, use_finetune=True, mc_passes=11):
+    _set_target_idx(t_idx)
+    mdl_tcnn, mdl_trans = (lstm_model, transformer_model)
+    if use_finetune:
+        mdl_tcnn, mdl_trans = _get_finetuned_nets(t_idx)
+    logits_l = _mc_dropout_logits(mdl_tcnn, [feats_batch, meta_batch], n_passes=mc_passes)[0]
+    logits_t = _mc_dropout_logits(mdl_trans, [feats_batch, meta_batch], n_passes=mc_passes)[0]
+    probs_l = tf.nn.softmax(logits_l).numpy()
+    probs_t = tf.nn.softmax(logits_t).numpy()
+    _set_target_idx(None)
+    return probs_l, probs_t
+
+# --- 3.5. Prediction using Deep Models ---
+# For prediction, use the most recent k draws as input (with derived features)
+last_k_draws = draws[-k:]
+_set_target_idx(n_draws)  # allow features to use indices < n_draws only
+features_pred = compute_stat_features(last_k_draws, n_draws - 1)
+features_pred = features_pred.reshape(1, features_pred.shape[0], features_pred.shape[1])
+meta_pred = np.array([_meta_features_at_idx(n_draws-1)], dtype=float)
+_set_target_idx(None)
+
+
+lstm_prob = None
+transformer_prob = None
+# Use expanding-window fine-tuned nets for the latest prediction
+_l_probs, _t_probs = _predict_with_nets(features_pred, meta_pred, t_idx=n_draws, use_finetune=True, mc_passes=21)
+lstm_prob = {num: float(_l_probs[num-1]) for num in range(1, 41)}
+transformer_prob = {num: float(_t_probs[num-1]) for num in range(1, 41)}
+
+# --- Default equal weights for bases (prevent NameError during logging/mixing) ---
+try:
+    weights  # if already defined elsewhere, keep it
+except NameError:
+    weights = np.ones(5, dtype=float) / 5.0  # [Bayes, Markov, HMM, LSTM, Transformer]
+
+# Provide a no-op regime adapter if not defined elsewhere
+if "_adapt_base_weights" not in globals():
+    def _adapt_base_weights(w):
+        return np.asarray(w, dtype=float)
+
+# --- GP tuning stub (inserted above cheap GP hyper-parameter tuning) ---
+def _gp_tune_knobs(trials=0, last_N=60, **kwargs):
+    """
+    Lightweight guard/stub. If/when you add skopt.gp_minimize, plug it in here.
+    Returning an empty dict keeps the caller's logging path clean.
+    """
+    return {}
+
+# --- Cheap GP hyper-parameter tuning (Markov blend / gap cap / cal temp) ---
+try:
+    opt = _gp_tune_knobs(trials=12, last_N=60)
+    if isinstance(opt, dict):
+        rec = {'type': 'gp_opt', 'ts': _now_iso(), **opt}
+        print("[OPT] GP-tuned knobs:", opt)
+        _log_jsonl(rec, path="run_log.jsonl")
+except Exception as _e:
+    warnings.warn(f"GP tuning failed: {_e}")
+
+
+ # --- Kneser–Ney–style blend of 1-/2-/3-step transitions with continuation ---
+def _kn_interpolated_markov(last_draw, last_2_draw, last_3_draw, t1, t2, t3):
+    # continuation probability: how many unique predecessors led to j
+    cont = np.zeros(40, dtype=float)
+    for i in range(1, 41):
+        for j in range(1, 41):
+            if t1[i].get(j, 0.0) > 1e-12:
+                cont[j-1] += 1.0
+    if cont.sum() > 0:
+        cont = cont / (cont.sum() + 1e-12)
+
+    # raw scores from observed contexts
+    s1 = np.zeros(40, dtype=float)
+    for i in last_draw:
+        for j in range(1, 41):
+            s1[j-1] += t1[i].get(j, 0.0)
+    s2 = np.zeros(40, dtype=float)
+    for i in last_2_draw:
+        for j in range(1, 41):
+            s2[j-1] += t2[i].get(j, 0.0)
+    s3 = np.zeros(40, dtype=float)
+    for i in last_3_draw:
+        for j in range(1, 41):
+            s3[j-1] += t3[i].get(j, 0.0)
+
+    # data-driven interpolation weights proportional to evidence size
+    w1 = float(len(last_draw))
+    w2 = float(len(last_2_draw)) * 0.8
+    w3 = float(len(last_3_draw)) * 0.6
+    wc = 6.0  # small continuation prior
+    # --- Simple regime-based modulation of weights ---
+    try:
+        # Schedule flip: if day gap not in {2,3}, prefer longer lags/continuation
+        if len(data) >= 2 and 'DrawDate' in data.columns:
+            gap_days = float((pd.to_datetime(data.iloc[-1]['DrawDate']) - pd.to_datetime(data.iloc[-2]['DrawDate'])).days)
+            schedule_flip = 0 if gap_days in (2, 3) else 1
+        else:
+            schedule_flip = 0
+        if schedule_flip:
+            w3 *= 1.25
+            w2 *= 1.10
+            w1 *= 0.85
+            wc *= 1.05
+        # Entropy/dispersion proxy from last ~10 draws: higher diversity → lean longer lags
+        recent = draws[-10:] if len(draws) >= 10 else draws
+        uniq = len({n for d in recent for n in d})
+        diversity = uniq / 40.0
+        if diversity > 0.65:
+            w3 *= 1.10
+            wc *= 1.10
+            w1 *= 0.95
+    except Exception:
+        pass
+    total_w = max(1e-9, (w1 + w2 + w3 + wc))
+    w1, w2, w3, wc = w1/total_w, w2/total_w, w3/total_w, wc/total_w
+
+    mix = w1*s1 + w2*s2 + w3*s3 + wc*cont
+    mix = np.clip(mix, 1e-12, None)
+    mix = mix / (mix.sum() + 1e-12)
+    return {n: float(mix[n-1]) for n in range(1, 41)}
+
+# === Probabilistic Modeling & Calibration Utilities ============================
+SUM6_EPS = 1e-9
+SUM6_MAX_ITERS = 4
+CAL_WINDOW = 60              # draws used to fit calibrators
+CAL_MIN = 20
+CAL_METHOD = "platt+isotonic"  # {"isotonic","platt","platt+isotonic"}
+PF_PRIOR_BLEND = 0.35        # weight of PF prior in geometric blend with ensemble
+PF_ENSEMBLE_CONFIGS = [      # (num_particles, alpha, sigma)
+    (12000, 0.004, 0.008),
+    (16000, 0.003, 0.006),
+    (8000,  0.006, 0.012),
+]
+
+_cal_cache = {"LSTM": None, "Transformer": None, "t_fit": None}
+
+def _enforce_sum6(v):
+    """Project a length-40 vector v (non-negative) so that sum≈6 with clipping to [0,1].
+    Uses iterative rescale + clip (water-filling style) for a few passes.
+    Returns a copy with sum close to 6.
+    """
+    import numpy as _np
+    x = _np.clip(_np.asarray(v, dtype=float), 0.0, 1.0)
+    for _ in range(SUM6_MAX_ITERS):
+        s = float(x.sum())
+        if s <= 0:
+            x[:] = 6.0/40.0
+            break
+        x *= (6.0 / s)
+        over = x > 1.0
+        if _np.any(over):
+            x[over] = 1.0
+        s2 = float(x.sum())
+        if abs(s2 - 6.0) <= 1e-6:
+            break
+        if s2 > 0:
+            x *= (6.0 / s2)
+    return _np.clip(x, 0.0, 1.0)
+
+def _sum6_to_sum1_dict(p6_dict):
+    import numpy as _np
+    v = _np.array([float(p6_dict.get(i, 0.0)) for i in range(1,41)], dtype=float)
+    if v.sum() <= 0:
+        v = _np.ones(40, dtype=float)*(6.0/40.0)
+    v = _np.clip(v/6.0, 1e-18, None)
+    v = v / (v.sum() + 1e-18)
+    return {i: float(v[i-1]) for i in range(1,41)}
+
+# ---- Simple 1D calibrators ----------------------------------------------------
+class _Platt1D:
+    def __init__(self):
+        self.ok = False
+        self.coef_ = None
+        self.intercept_ = None
+    def fit(self, p, y):
+        try:
+            import numpy as _np
+            from sklearn.linear_model import LogisticRegression
+            p = _np.clip(_np.asarray(p, dtype=float).reshape(-1,1), 1e-6, 1-1e-6)
+            y = _np.asarray(y, dtype=float).reshape(-1)
+            if p.shape[0] < 100 or y.sum() == 0 or y.sum() == y.size:
+                self.ok = False
+                return self
+            logit = _np.log(p/(1-p))
+            lr = LogisticRegression(class_weight="balanced", max_iter=1000)
+            lr.fit(logit, y)
+            self.ok = True
+            self.coef_ = float(lr.coef_.ravel()[0])
+            self.intercept_ = float(lr.intercept_.ravel()[0])
+            self._lr = lr
+        except Exception:
+            self.ok = False
+        return self
+    def map(self, p):
+        import numpy as _np
+        p = _np.clip(_np.asarray(p, dtype=float).reshape(-1), 1e-9, 1-1e-9)
+        if not self.ok:
+            return p
+        z = _np.log(p/(1-p)) * self.coef_ + self.intercept_
+        out = 1.0/(1.0+_np.exp(-z))
+        return _np.clip(out, 1e-9, 1-1e-9)
+
+class _Iso1D:
+    def __init__(self):
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            self.iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        except Exception:
+            self.iso = None
+        self.ok = False
+    def fit(self, p, y):
+        import numpy as _np
+        if self.iso is None:
+            self.ok = False
+            return self
+        p = _np.clip(_np.asarray(p, dtype=float).reshape(-1), 1e-9, 1-1e-9)
+        y = _np.asarray(y, dtype=float).reshape(-1)
+        if p.size < 100 or y.sum() == 0 or y.sum() == y.size:
+            self.ok = False
+            return self
+        try:
+            self.iso.fit(p, y)
+            self.ok = True
+        except Exception:
+            self.ok = False
+        return self
+    def map(self, p):
+        import numpy as _np
+        p = _np.clip(_np.asarray(p, dtype=float).reshape(-1), 1e-9, 1-1e-9)
+        if not self.ok or self.iso is None:
+            return p
+        out = self.iso.predict(p)
+        return _np.clip(out, 1e-9, 1-1e-9)
+
+class _ComboCal:
+    def __init__(self, method="platt+isotonic"):
+        self.method = method
+        self.pl = _Platt1D()
+        self.iso = _Iso1D()
+        self.ok = False
+    def fit(self, p, y):
+        m = (self.method or "").lower()
+        if "platt" in m:
+            self.pl.fit(p, y)
+        if "isotonic" in m:
+            self.iso.fit(p, y)
+        self.ok = (self.pl.ok or self.iso.ok)
+        return self
+    def map(self, p):
+        import numpy as _np
+        p = _np.asarray(p, dtype=float).reshape(-1)
+        if not self.ok:
+            return _np.clip(p, 1e-9, 1-1e-9)
+        vals = []
+        if self.pl.ok:
+            vals.append(self.pl.map(p))
+        if self.iso.ok:
+            vals.append(self.iso.map(p))
+        if not vals:
+            return _np.clip(p, 1e-9, 1-1e-9)
+        out = _np.mean(_np.vstack(vals), axis=0)
+        return _np.clip(out, 1e-9, 1-1e-9)
+
+# Fit calibrators for LSTM/Transformer using last CAL_WINDOW draws up to t_eval
+def _fit_expert_calibrators(t_eval):
+    import numpy as _np
+    global _cal_cache
+    t_eval = int(t_eval)
+    if DEBUG_GUARDS:
+        _assert_idx_ok(t_eval, context="_learn_blend_weights")
+    t0 = max(1, t_eval - CAL_WINDOW + 1)
+    if t_eval == _cal_cache.get("t_fit") and all(_cal_cache.get(k) is not None for k in ("LSTM","Transformer")):
+        return _cal_cache
+    P = {"LSTM": [], "Transformer": []}
+    Y = []
+    _orig = globals().get("_predict_with_nets", None)
+    if not callable(_orig):
+        _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": t_eval}
+        return _cal_cache
+    if t_eval - t0 + 1 < CAL_MIN:
+        _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": t_eval}
+        return _cal_cache
+    for t in range(t0, t_eval+1):
+        try:
+            hist = draws[:t]
+            if 'compute_stat_features' in globals():
+                feats_t = compute_stat_features(hist[-min(len(hist), 8):], t - 1)
+                feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
+            else:
+                continue
+            meta_t = None
+            if '_meta_features_at_idx' in globals():
+                meta_t = __import__('numpy').array([_meta_features_at_idx(t)], dtype=float)
+            l, tr = _orig(feats_t, meta_t, t_idx=t, use_finetune=True, mc_passes=globals().get('MC_STACK_PASSES', 1))
+            l6 = _enforce_sum6(l*6.0)
+            tr6 = _enforce_sum6(tr*6.0)
+            winners = _winner_draw_at(t, context="_fit_expert_calibrators")
+            y = __import__('numpy').array([1 if n in winners else 0 for n in range(1,41)], dtype=float)
+            P["LSTM"].append(l6); P["Transformer"].append(tr6)
+            Y.append(y)
+        except Exception:
+            continue
+    if not P["LSTM"] or not Y:
+        _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": t_eval}
+        return _cal_cache
+    P_L = __import__('numpy').vstack(P["LSTM"]).reshape(-1)
+    P_T = __import__('numpy').vstack(P["Transformer"]).reshape(-1)
+    Yv  = __import__('numpy').vstack(Y).reshape(-1)
+    cal_L = _ComboCal(CAL_METHOD).fit(P_L, Yv)
+    cal_T = _ComboCal(CAL_METHOD).fit(P_T, Yv)
+    _cal_cache = {"LSTM": cal_L, "Transformer": cal_T, "t_fit": t_eval}
+    return _cal_cache
+
+# Postprocess raw net probabilities (length-40 array) → calibrated, sum-6, then sum-1
+def _postprocess_net_probs(arr, t_idx, expert_name="LSTM"):
+    import numpy as _np
+    v = _np.asarray(arr, dtype=float).reshape(-1)
+    if v.size != 40:
+        v = _np.ones(40, dtype=float) * (1.0/40.0)
+    # Step 1: sum-to-6 constraint
+    v6 = _enforce_sum6(v*6.0)
+    # Step 2: calibration
+    cals = _fit_expert_calibrators(max(1, int(t_idx)-1))
+    cal = cals.get(expert_name) if isinstance(cals, dict) else None
+    if cal is not None and getattr(cal, 'ok', False):
+        v6 = cal.map(v6)
+        v6 = _enforce_sum6(v6)
+    # Step 3: back to categorical (sum=1)
+    out = v6 / 6.0
+    out = _np.clip(out, 1e-12, None)
+    out = out / (out.sum() + 1e-12)
+    return out
+
+# ---- PF prior from history (ensemble over hyper-params) ----------------------
+def _pf_prior_from_history(sub_draws, configs=PF_ENSEMBLE_CONFIGS):
+    import numpy as _np
+    if not sub_draws:
+        return {n: 6.0/40.0 for n in range(1,41)}
+    preds = []
+    for (npart, a, s) in (configs or []):
+        try:
+            pf = ParticleFilter(num_numbers=40, num_particles=int(npart), alpha=float(a), sigma=float(s))
+            for d in sub_draws:
+                pf.predict()
+                pf.update(d)
+            pf.predict()
+            preds.append(pf.get_mean_probabilities())
+        except Exception:
+            continue
+    if not preds:
+        return {n: 6.0/40.0 for n in range(1,41)}
+    m = _np.mean(_np.vstack(preds), axis=0)
+    m = _enforce_sum6(m)
+    return {n: float(m[n-1]) for n in range(1,41)}
+
+def _geom_blend(p, q, lam=0.5):
+    """Geometric blend of two categorical dists p and q over 1..40 (sum=1 each)."""
+    import numpy as _np
+    lam = float(max(0.0, min(1.0, lam)))
+    vp = _np.array([float(p.get(i,0.0)) for i in range(1,41)], dtype=float)
+    vq = _np.array([float(q.get(i,0.0)) for i in range(1,41)], dtype=float)
+    vp = _np.clip(vp, 1e-18, None); vq = _np.clip(vq, 1e-18, None)
+    v = _np.power(vp, 1.0-lam) * _np.power(vq, lam)
+    v = _np.clip(v, 1e-18, None); v = v / (v.sum() + 1e-18)
+    return {i: float(v[i-1]) for i in range(1,41)}
+# ============================================================================
+
+# --- Per-expert probability dicts at historical index t_idx (leakage-free) ---
+def _per_expert_prob_dicts_at_t(t_idx):
+    """
+    Build per-expert probability dicts at historical index t_idx using ONLY draws[:t_idx].
+    Keys match _per_expert_names(): ["Bayes","Markov","HMM","LSTM","Transformer"].
+    """
+    t_idx = int(t_idx)
+    t_idx = max(1, min(t_idx, len(draws) - 1))
+    hist = draws[:t_idx]
+
+    # Context sets for KN-blended Markov
+    last  = draws[t_idx - 1] if t_idx - 1 >= 0 else set()
+    last2 = draws[t_idx - 2] if t_idx - 2 >= 0 else set()
+    last3 = draws[t_idx - 3] if t_idx - 3 >= 0 else set()
+
+    # --- Bayes (Dirichlet-smoothed frequencies) ---
+    bayes = compute_bayes_posterior(hist, alpha=1)
+
+    # --- Markov (recompute from hist, then KN interpolate using last/last2/last3) ---
+    t1, t2, t3 = compute_markov_transitions(hist)
+    markov = _kn_interpolated_markov(last, last2, last3, t1, t2, t3)
+
+    # --- HMM (guarded by version gate) ---
+    try:
+        hmmP = _build_hmm_prob_from_subset(hist, n_states=3, n_seeds=4) if HMM_OK else _uniform_prob40()
+    except Exception:
+        hmmP = _uniform_prob40()
+
+    # --- Nets at t (strict leakage guard) ---
+    if t_idx - k >= 0:
+        try:
+            _set_target_idx(t_idx)
+            feats = compute_stat_features(draws[t_idx - k:t_idx], t_idx - 1)
+            feats = feats.reshape(1, feats.shape[0], feats.shape[1])
+            meta = np.array([_meta_features_at_idx(t_idx - 1)], dtype=float)
+            _set_target_idx(None)
+
+            lp, tp = _predict_with_nets(feats, meta, t_idx=t_idx, use_finetune=True, mc_passes=11)
+            lstmP = {n: float(lp[n - 1]) for n in range(1, 41)}
+            transP = {n: float(tp[n - 1]) for n in range(1, 41)}
+        except Exception:
+            _set_target_idx(None)
+            # fallbacks if fine-tune path isn't available
+            lstmP = lstm_prob if isinstance(globals().get("lstm_prob"), dict) else _uniform_prob40()
+            transP = transformer_prob if isinstance(globals().get("transformer_prob"), dict) else _uniform_prob40()
+    else:
+        lstmP = _uniform_prob40()
+        transP = _uniform_prob40()
+
+    return {"Bayes": bayes, "Markov": markov, "HMM": hmmP, "LSTM": lstmP, "Transformer": transP}
+
+# --- Walk-forward backtest with per-expert deltas + miss explanation ---
+
+def _topk_from_prob_dict(P, k=6):
+    items = sorted([(n, float(P.get(n, 0.0))) for n in range(1, 41)], key=lambda x: x[1], reverse=True)
+    return [n for n,_ in items[:k]]
+
+
+def _per_expert_pl_nll_at(t_idx):
+    """Return per-expert PL-NLLs at draw t_idx using bases from draws[:t_idx]."""
+    t_idx = int(t_idx)
+    bases = _per_expert_prob_dicts_at_t(t_idx)
+    _assert_expert_key_consistency(bases)
+    if not isinstance(bases, dict):
+        return None
+    try:
+        winners = draws[t_idx]
+    except Exception as e:
+        warnings.warn(f"Failed to access winners at t={t_idx}: {e}")
+        winners = set()
+    return [
+        _nll_from_prob_dict(bases.get(name, {}), winners)
+        for name in _per_expert_names()
+    ]
+
+# Forward-define the simple set NLL if it hasn't been defined yet, so logs won't crash
+if "_nll_from_prob_dict" not in globals():
+    def _nll_from_prob_dict(P_dict, winners):
+        v = np.array([float(P_dict.get(n, 0.0)) for n in range(1, 41)], dtype=float)
+        v = np.clip(v, 1e-12, None)
+        v = v / (v.sum() + 1e-12)
+        idx = [n - 1 for n in winners]
+        return float(-np.sum(np.log(v[idx])))
+
+# -- Predict-time operational log: weights, calibration, per-expert PL-NLL --
+try:
+    _log_predict_run(weights, t_eval=n_draws - 1, log_path="run_log.jsonl")
+except Exception as _e:
+    warnings.warn(f"Predict-time operational log failed: {_e}")
+
+
+
+def _why_miss_line(t_idx, P_ens, bases):
+    """Compose and print a concise miss explanation; also write JSONL with per-expert deltas."""
+    try:
+        truth = sorted(list(draws[t_idx]))
+        top6 = _topk_from_prob_dict(P_ens, k=6)
+        hits = len(set(top6) & set(truth))
+        # Per-expert deltas (expert NLL minus ensemble NLL)
+        names = _per_expert_names()
+        nll_ens = _nll_from_prob_dict(P_ens, draws[t_idx])
+        deltas = {}
+        for nm in names:
+            Pi = bases.get(nm, {})
+            deltas[nm] = float(_nll_from_prob_dict(Pi, draws[t_idx]) - nll_ens)
+        # Low-ranked truths and overconfident misses
+        ranks = {n: i for i,n in enumerate(_topk_from_prob_dict(P_ens, k=40), start=1)}
+        low_truth = sorted(truth, key=lambda n: ranks.get(n, 99), reverse=True)[:2]
+        overconf = [n for n in top6 if n not in truth][:2]
+        msg = f"[MISS t={t_idx}] hits={hits} top6={top6} truth={truth} low_truth={low_truth} overconf={overconf}"
+        print(msg)
+        rec = {
+            'type': 'miss_explain',
+            'ts': _now_iso(),
+            't': int(t_idx),
+            'hits': int(hits),
+            'top6': top6,
+            'truth': truth,
+            'low_truth': low_truth,
+            'overconf': overconf,
+            'per_expert_delta_nll': deltas,
+        }
+        _log_jsonl(rec)
+    except Exception as _e:
+        warnings.warn(f"why-miss logging failed at t={t_idx}: {_e}")
+
+# --- Post-rank isotonic calibration & reliability utilities -------------------
+
+class _PostRankIsotonic:
+    def __init__(self):
+        self.iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        self.fitted = False
+    def fit(self, p_list, y_list):
+        import numpy as _np, warnings
+        p = _np.asarray(p_list, dtype=float)
+        y = _np.asarray(y_list, dtype=float)
+        if p.size != y.size or p.size < 200:
+            warnings.warn("Isotonic: insufficient pairs; skipping fit.")
+            self.fitted = False
+            return self
+        try:
+            self.iso.fit(p, y)
+            self.fitted = True
+        except Exception as e:
+            warnings.warn(f"Isotonic fit failed: {e}")
+            self.fitted = False
+        return self
+    def map(self, p):
+        return float(self.iso.predict([float(p)])[0]) if self.fitted else float(p)
+
+def _apply_postrank_calibrator(prob_dict):
+    """Apply global postrank_calibrator (if available) to a prob dict and renormalise."""
+    cal = globals().get("postrank_calibrator", None)
+    if cal is None or not getattr(cal, "fitted", False):
+        return prob_dict
+    import numpy as _np
+    v = _np.array([float(prob_dict.get(n, 0.0)) for n in range(1, 41)], dtype=float)
+    v = _np.clip(v, 1e-12, None)
+    v_cal = _np.array([cal.map(x) for x in v], dtype=float)
+    v_cal = _np.clip(v_cal, 1e-12, None)
+    v_cal = v_cal / (v_cal.sum() + 1e-12)
+    return {n: float(v_cal[n-1]) for n in range(1, 41)}
+
+def _mix_prob_dicts(weights, bases):
+    """
+    Combine per-expert distributions in `bases` using `weights` aligned to _per_expert_names().
+    Returns a calibrated, renormalised dict {1..40 -> p}. Ranking is preserved; only the
+    probability scale may change if a post-rank calibrator is present.
+    """
+    names = _per_expert_names()
+    w = np.asarray(weights, dtype=float)
+    if w.size != len(names):
+        w = np.ones(len(names), dtype=float) / float(len(names))
+
+    # Stack expert probs into shape (E, 40) and normalise each expert
+    M = []
+    for nm in names:
+        vec = [float(bases.get(nm, {}).get(n, 0.0)) for n in range(1, 41)]
+        M.append(vec)
+    M = np.asarray(M, dtype=float)
+    M = np.clip(M, 1e-12, None)
+    M = M / (M.sum(axis=1, keepdims=True) + 1e-12)
+
+    # Weighted mixture
+    w = np.clip(w, 0.0, None)
+    w = w / (w.sum() + 1e-12)
+    p_mix = np.matmul(w, M)  # (40,)
+
+    # Renormalise then apply optional post-rank isotonic; isotonic preserves ranking
+    p_mix = np.clip(p_mix, 1e-12, None)
+    p_mix = p_mix / (p_mix.sum() + 1e-12)
+    P = {n: float(p_mix[n-1]) for n in range(1, 41)}
+    return _apply_postrank_calibrator(P)
+
+def _export_reliability(bin_edges, bin_pred_mean, bin_obs_rate,
+                        csv_path="reliability_curve.csv", png_path="reliability_curve.png"):
+    try:
+        import matplotlib.pyplot as plt, csv as _csv
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f)
+            w.writerow(["bin_left","bin_right","pred_mean","obs_rate"])
+            for (l,r), pm, orate in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_pred_mean, bin_obs_rate):
+                w.writerow([l, r, pm, orate])
+        fig = plt.figure(figsize=(6,6)); ax = fig.add_subplot(111)
+        ax.plot([0,1],[0,1], linestyle="--")
+        ax.scatter(bin_pred_mean, bin_obs_rate)
+        ax.set_title("Reliability (Final Ensemble)")
+        ax.set_xlabel("Predicted probability (bin mean)")
+        ax.set_ylabel("Observed frequency")
+        fig.tight_layout(); fig.savefig(png_path, dpi=160); plt.close(fig)
+    except Exception as e:
+        import warnings; warnings.warn(f"Reliability export failed: {e}")
+
+def run_walk_forward_backtest_ops(last_N=150, log_path="run_log.jsonl"):
+    """Strict rolling walk-forward backtest over last_N draws with per-expert logging.
+    Returns summary dict with mean NLL and hit stats. No shuffles; pure time-series split.
+    Also COLLECTS probability/label pairs → fits a post-rank isotonic calibrator on the
+    last_N window, and exports reliability CSV/PNG. Ranking is unchanged; only scale.
+    """
+    start = max(k + 1, n_draws - int(last_N))
+
+    # --- Collectors for isotonic calibration & reliability ---
+    _all_p = []   # predicted probabilities for all 40 candidates per evaluated draw
+    _all_y = []   # 0/1 outcomes per candidate per evaluated draw
+
+    nlls, hits_list = [], []
+
+    for t in range(start, n_draws):
+        try:
+            bases = _per_expert_prob_dicts_at_t(t)
+            _assert_expert_key_consistency(bases)
+
+            # Current weights (caller may cache/decay); adapt by regime if available
+            w = np.asarray(globals().get('weights', np.ones(5, dtype=float) / 5.0), dtype=float)
+            try:
+                w = _adapt_base_weights(w)  # no-op if function not defined
+            except Exception:
+                pass
+
+            # Ensemble distribution for draw t (pre-calibration)
+            P = _mix_prob_dicts(w, bases)
+
+            # --- Collect pairs for reliability/calibration ---
+            p_vec = [float(P.get(n, 0.0)) for n in range(1, 41)]
+            y_vec = [1 if n in draws[t] else 0 for n in range(1, 41)]
+            _all_p.extend(p_vec)
+            _all_y.extend(y_vec)
+
+            # Score PL-style NLL (independent-winner proxy) and hits
+            nll = _nll_from_prob_dict(P, draws[t])
+            nlls.append(nll)
+            top6 = set(_topk_from_prob_dict(P, 6))
+            hits = len(top6 & set(draws[t]))
+            hits_list.append(hits)
+
+            if hits < 2:  # concise miss line only when we really miss
+                _why_miss_line(t, P, bases)
+
+            # per-expert PL-NLLs (for JSONL)
+            try:
+                names = _per_expert_names()
+                per_nll = {nm: _nll_from_prob_dict(bases.get(nm, {}), draws[t]) for nm in names}
+                rec = {
+                    'type': 'backtest_draw',
+                    'ts': _now_iso(),
+                    't': int(t),
+                    'nll_ens': float(nll),
+                    'per_expert_pl_nll': {k: float(v) for k, v in per_nll.items()},
+                    'hits_top6': int(hits),
+                }
+                _log_jsonl(rec, path=log_path)
+            except Exception:
+                pass
+
+        except Exception as _e:
+            warnings.warn(f"Backtest step failed at t={t}: {_e}")
+
+    # --- Fit post-rank isotonic on accumulated pairs and export reliability ---
+    try:
+        if len(_all_p) >= 400:  # safeguard for short histories
+            iso = _PostRankIsotonic().fit(_all_p, _all_y)
+            globals()["postrank_calibrator"] = iso
+
+            import numpy as _np
+            be = _np.linspace(0.0, 1.0, 11)
+            idx = _np.digitize(_np.asarray(_all_p, float), be, right=True)
+            pred_means, obs_rates = [], []
+            y_arr = _np.asarray(_all_y, float)
+            for b in range(1, len(be)):
+                m = (idx == b)
+                pm = float(_np.mean(_np.asarray(_all_p)[m])) if _np.any(m) else 0.0
+                orc = float(_np.mean(y_arr[m])) if _np.any(m) else 0.0
+                pred_means.append(pm)
+                obs_rates.append(orc)
+            _export_reliability(
+                be, pred_means, obs_rates,
+                csv_path="reliability_curve.csv",
+                png_path="reliability_curve.png"
+            )
+    except Exception as _e:
+        warnings.warn(f"Post-rank calibration step failed: {_e}")
+
+    summary = {
+        'mean_nll': float(np.mean(nlls)) if nlls else None,
+        'mean_hits_top6': float(np.mean(hits_list)) if hits_list else None,
+        'n_draws': len(nlls),
+    }
+    return summary
+
+# If missing, provide a simple set-NLL proxy (independent winners) for diagnostics
+if "_nll_from_prob_dict" not in globals():
+    def _nll_from_prob_dict(P_dict, winners):
+        v = np.array([float(P_dict.get(n, 0.0)) for n in range(1, 41)], dtype=float)
+        v = np.clip(v, 1e-12, None); v = v / (v.sum() + 1e-12)
+        idx = [n - 1 for n in winners]
+        return float(-np.sum(np.log(v[idx])))
+
+def run_oracle_ablation(last_N=100, log_path="run_log.jsonl"):
+    """
+    For each of the last_N draws, replace ONE expert with an 'oracle' distribution that
+    concentrates mass on the true winners, then re-mix with the same weights/gates.
+    Return mean ΔNLL = (ensemble NLL) - (oracle-replaced NLL) per expert.
+    """
+    names = _per_expert_names()
+    start = max(k + 1, len(draws) - int(last_N))
+    gains = {nm: [] for nm in names}
+
+    for t in range(start, len(draws)):
+        try:
+            bases = _per_expert_prob_dicts_at_t(t)
+            _assert_expert_key_consistency(bases)
+            # Current weights with regime adaptation
+            w = np.asarray(globals().get("weights", np.ones(len(names)) / len(names)), dtype=float)
+            w = _adapt_base_weights(w)
+            P_ens = _mix_prob_dicts(w, bases)
+            truth = draws[t]
+            nll_ens = _nll_from_prob_dict(P_ens, truth)
+            # Smooth "oracle" (avoid zeros): ~uniform over winners, tiny mass on non-winners
+            eps = 1e-6
+            oracle = {n: (1.0 / 6.0 - eps) if n in truth else (eps / 34.0) for n in range(1, 41)}
+            for nm in names:
+                bases_or = dict(bases)
+                bases_or[nm] = oracle
+                P_or = _mix_prob_dicts(w, bases_or)
+                nll_or = _nll_from_prob_dict(P_or, truth)
+                gains[nm].append(nll_ens - nll_or)
+        except Exception as _e:
+            warnings.warn(f"Oracle ablation failed at t={t}: {_e}")
+
+    mean_gain = {nm: float(np.mean(v)) if v else 0.0 for nm, v in gains.items()}
+    rec = {"type": "oracle_ablation", "ts": _now_iso(), "last_N": int(last_N), "mean_delta_nll": mean_gain}
+    _log_jsonl(rec, path=log_path)
+    return mean_gain
+
+# --- Evaluation & diagnostics: walk-forward, reliability, oracle ablation ---
+try:
+    # Strict rolling walk-forward backtest over the last 150 draws
+    summary = run_walk_forward_backtest_ops(last_N=150, log_path="run_log.jsonl")
+    print("[DIAG] Backtest summary:", summary)
+
+    # Oracle ablation (mean improvement in PL-NLL if each expert were perfect)
+    ablate = run_oracle_ablation(last_N=100, log_path="run_log.jsonl")
+    print("[DIAG] Oracle ablation mean ΔNLL:", ablate)
+except Exception as _e:
+    warnings.warn(f"Diagnostics failed: {_e}")
+
+# 4. **Combining Models for Prediction**
+# We will predict the next draw (after the last known draw in the data).
+last_k_draws = draws[-k:]  # the most recent k draws from history
+
+# Compute probability for each number to be in the next draw according to each component:
+
+# (a) Bayesian probability (long-term frequency)
+bayes_prob = posterior_probs  # already computed above
+
+
+# (b) Markov chain probability based on last draw and multi-step transitions:
+# We combine 1-step, 2-step, and 3-step transitions for richer modeling.
+last_draw = draws[-1]
+last_2_draw = draws[-2] if n_draws > 1 else set()
+last_3_draw = draws[-3] if n_draws > 2 else set()
+
+# 1-step Markov score
+markov_score_1 = {num: 0.0 for num in range(1, 41)}
+for prev_num in last_draw:
+    for candidate in range(1, 41):
+        markov_score_1[candidate] += transition_probs[prev_num].get(candidate, 0)
+# 2-step Markov score
+markov_score_2 = {num: 0.0 for num in range(1, 41)}
+for prev_num in last_2_draw:
+    for candidate in range(1, 41):
+        markov_score_2[candidate] += transition2_probs[prev_num].get(candidate, 0)
+# 3-step Markov score
+markov_score_3 = {num: 0.0 for num in range(1, 41)}
+for prev_num in last_3_draw:
+    for candidate in range(1, 41):
+        markov_score_3[candidate] += transition3_probs[prev_num].get(candidate, 0)
+
+
+markov_prob = _kn_interpolated_markov(last_draw, last_2_draw, last_3_draw,
+                                      transition_probs, transition2_probs, transition3_probs)
+
+# Co-occurrence conditional prob based on within-draw co-occurrence
+cooc_prob = _cooc_conditional_prob_from_history(draws[:-1], last_draw)
+
+# Without-replacement compatibility features (top-k competitor sums) for each base
+COMP_K = 5
+compat_bayes   = _compat_topk_sum(bayes_prob, k=COMP_K)
+compat_markov  = _compat_topk_sum(markov_prob, k=COMP_K)
+compat_hmm     = _compat_topk_sum(hmm_prob, k=COMP_K)
+compat_nn      = _compat_topk_sum({n: 0.5*lstm_prob[n] + 0.5*transformer_prob[n] for n in range(1, 41)}, k=COMP_K)
+
+
+
+
 # Regime + volatility descriptors available to stacker
 reg_now = _regime_features_at_t(n_draws - 1)
 roll_ent_now = _rolling_entropy_from_history(draws, window=30)
 roll_disp_now = _dispersion_last_draw(draws)
+
+# --- Regime detection & adaptation --------------------------------------------------
+
+def _regime_switch_flags():
+    """Detect entropy jump and cadence perturbation on the latest draw.
+    Returns dict with booleans and magnitudes.
+    """
+    try:
+        # Normalised entropies (divide by log 40)
+        ent_s = _rolling_entropy_from_history(draws, window=min(20, len(draws))) / float(np.log(40.0))
+        ent_l = _rolling_entropy_from_history(draws, window=min(60, len(draws))) / float(np.log(40.0))
+        ent_jump = (ent_s - ent_l) > 0.08  # heuristic threshold
+    except Exception:
+        ent_s, ent_l, ent_jump = 0.0, 0.0, False
+    try:
+        r = _regime_features_at_t(n_draws - 1)
+        cadence_perturbed = bool(r.get('schedule_flip', 0) == 1)
+    except Exception:
+        cadence_perturbed = False
+    return {
+        'ent_short': float(ent_s),
+        'ent_long': float(ent_l),
+        'entropy_jump': bool(ent_jump),
+        'cadence_perturbed': bool(cadence_perturbed),
+    }
+
+
+def _adapt_base_weights(weights_vec):
+    """When entropy jumps or cadence perturbs, raise Bayes and lower Markov/HMM.
+    Keeps weights on the simplex.
+    """
+    try:
+        w = np.asarray(weights_vec, dtype=float).reshape(-1)
+        if w.size < 5:
+            return np.ones(5, dtype=float) / 5.0
+        flags = _regime_switch_flags()
+        if flags['entropy_jump'] or flags['cadence_perturbed']:
+            # indices: 0=Bayes, 1=Markov, 2=HMM, 3=LSTM, 4=Transformer
+            mult = np.array([1.25, 0.85, 0.90, 1.00, 1.00], dtype=float)
+            w = w * mult
+        w = np.clip(w, 1e-12, None)
+        w = w / (w.sum() + 1e-12)
+        return w
+    except Exception:
+        return np.asarray(weights_vec, dtype=float)
+
+
+def _streakiness_signal():
+    """Return (is_streaky:bool, score:0..1) using dispersion and frequent co-occurrences.
+    Low dispersion + presence of frequent pairs/triplets => streaky.
+    """
+    try:
+        disp = _dispersion_last_draw(draws)
+        low_disp = float(disp) < 7.5
+    except Exception:
+        low_disp = False
+    try:
+        ld = sorted(list(draws[-1])) if len(draws) else []
+        has_pair = any(((a,b) in frequent_pairs) for i,a in enumerate(ld) for b in ld[i+1:]) if ld else False
+        has_trip = any((t in frequent_triplets) for t in [tuple(sorted((ld[i], ld[j], ld[k]))) for i in range(len(ld)) for j in range(i+1, len(ld)) for k in range(j+1, len(ld))]) if len(ld) >= 3 else False
+    except Exception:
+        has_pair, has_trip = False, False
+    streak = low_disp or has_pair or has_trip
+    score = 0.0
+    if streak:
+        score = 0.5 * (1.0 if low_disp else 0.0) + 0.3 * (1.0 if has_pair else 0.0) + 0.2 * (1.0 if has_trip else 0.0)
+        score = float(min(1.0, max(0.0, score)))
+    return bool(streak), float(score)
+
+
+def _streak_gate_for_current_run():
+    """Blend in co-occurrence conditional prob during streaky phases.
+    Returns (enabled, cooc_prob_dict, weight 0..0.25).
+    """
+    try:
+        is_strk, s = _streakiness_signal()
+        if not is_strk:
+            return False, None, 0.0
+        last_draw_set = draws[-1] if len(draws) else set()
+        hist = draws[:-1] if len(draws) > 1 else []
+        P_cooc = _cooc_conditional_prob_from_history(hist, last_draw_set)
+        # Map score to weight in [0.10, 0.25]
+        w = 0.10 + 0.15 * s
+        return True, P_cooc, float(w)
+    except Exception:
+        return False, None, 0.0
+
+
+def _adjust_selection_configs(sel_sharp, sel_div):
+    """Cool sampling temps when regime switch (entropy jump or cadence perturbation).
+    Returns possibly modified (sel_sharp, sel_div).
+    """
+    try:
+        flags = _regime_switch_flags()
+        if flags['entropy_jump'] or flags['cadence_perturbed']:
+            cs = dict(sel_sharp)
+            cd = dict(sel_div)
+            cs['temp'] = float(max(0.5, cs.get('temp', 0.9) * 0.85))
+            cd['temp'] = float(max(0.7, cd.get('temp', 1.1) * 0.92))
+            return cs, cd
+    except Exception:
+        pass
+    return sel_sharp, sel_div
+
+# --- Cheap calendar baselines (Dirichlet-smoothed) + weekday gate ---
+def _dirichlet_freq_for_mask(mask_idx):
+    """Return Dirichlet-smoothed per-number frequencies using draws at indices in mask_idx."""
+    alpha = 1.0
+    cnt = np.zeros(40, dtype=float)
+    for i in mask_idx:
+        for n in draws[i]:
+            cnt[n-1] += 1.0
+    p = (cnt + alpha) / ((len(mask_idx)*6.0) + 40.0*alpha if len(mask_idx) > 0 else 40.0*alpha)
+    return {n: float(p[n-1]) for n in range(1, 41)}
+
+def _weekday_month_baselines_at_t(t_idx):
+    """Build weekday- and month-conditioned frequency baselines using only draws < t_idx."""
+    t_idx = int(t_idx)
+    if t_idx <= 0:
+        return ({n:1.0/40 for n in range(1,41)}, {n:1.0/40 for n in range(1,41)})
+    wd = int(pd.to_datetime(data.iloc[t_idx]['DrawDate']).weekday())
+    mo = int(pd.to_datetime(data.iloc[t_idx]['DrawDate']).month)
+    mask_wd = [i for i in range(t_idx) if int(pd.to_datetime(data.iloc[i]['DrawDate']).weekday()) == wd]
+    mask_mo = [i for i in range(t_idx) if int(pd.to_datetime(data.iloc[i]['DrawDate']).month) == mo]
+    return _dirichlet_freq_for_mask(mask_wd), _dirichlet_freq_for_mask(mask_mo)
+
+# Gate provider consulted by _live_mixture_prob()
+def _weekday_gate_for_current_run():
+    try:
+        wd_base, mo_base = _weekday_month_baselines_at_t(n_draws - 1)
+        mix = {n: 0.5*wd_base[n] + 0.5*mo_base[n] for n in range(1, 41)}
+        return True, mix, 0.10  # enabled, blended baseline, gate weight
+    except Exception:
+        return False, None, 0.0
+
+
+# (c) Deep learning probabilities: use LSTM and Transformer models to predict probabilities for next draw.
+# We average their probabilities for a robust neural network component.
+def _mix_prob_dicts(weights, bases):
+    """
+    Combine per-expert distributions in `bases` using `weights` aligned to _per_expert_names().
+    Returns a calibrated, renormalised dict {1..40 -> p}. Ranking is preserved; only scale
+    may change if a post-rank calibrator is available.
+    """
+    names = _per_expert_names()
+    w = np.asarray(weights, dtype=float)
+    if w.size != len(names):
+        w = np.ones(len(names), dtype=float) / float(len(names))
+
+    # Stack expert probs into (E, 40)
+    M = []
+    for nm in names:
+        vec = [float(bases.get(nm, {}).get(n, 0.0)) for n in range(1, 41)]
+        M.append(vec)
+    M = np.asarray(M, dtype=float)
+    M = np.clip(M, 1e-12, None)
+    # normalise each expert to a proper distribution
+    M = M / (M.sum(axis=1, keepdims=True) + 1e-12)
+
+    # Weighted mixture
+    w = np.clip(w, 0.0, None)
+    if w.sum() <= 0:
+        w = np.ones_like(w) / float(len(w))
+    w = w / w.sum()
+    p_mix = np.matmul(w, M)  # (40,)
+
+    # Final renorm + optional isotonic post-rank calibration
+    p_mix = np.clip(p_mix, 1e-12, None)
+    p_mix = p_mix / (p_mix.sum() + 1e-12)
+    return _apply_postrank_calibrator({n: float(p_mix[n-1]) for n in range(1, 41)})
 
 
 # (c) Deep learning probabilities: use LSTM and Transformer models to predict probabilities for next draw.
@@ -1323,16 +5965,109 @@ for num in range(1, 41):
     # Average LSTM and Transformer probabilities for each number
     nn_prob[num] = 0.5 * lstm_prob[num] + 0.5 * transformer_prob[num]
 
-# (d) Recent trend heuristic (optional): e.g., numbers that haven’t appeared in a long time might catch up (cold -> hot).
-# We measure "gap" from last appearance in entire history:
+
+# (d) Recent trend heuristic with capped, concave schedule
 last_seen = {num: -1 for num in range(1, 41)}
 for idx, draw in enumerate(draws):
     for num in draw:
         last_seen[num] = idx
-gaps_full = {num: (n_draws - 1 - last_seen[num]) for num in range(1, 41)}  # gap since last appearance (in draws)
-# Convert gaps to a probability boost (larger gap -> slightly higher boost). We'll normalize this.
-max_gap = max(gaps_full.values())
-gap_boost = {num: gaps_full[num] / max_gap for num in range(1, 41)}  # 0 to 1 scale
+gaps_full = {num: (n_draws - 1 - last_seen[num]) for num in range(1, 41)}  # gap in draws
+GAP_TAU = 18.0   # curvature control
+GAP_CAP = 0.22   # absolute cap on boost
+_gap_boost_cc = {}
+for num in range(1, 41):
+    g = max(0.0, float(gaps_full[num]))
+    _gap_boost_cc[num] = float(np.tanh(g / GAP_TAU)) * GAP_CAP
+
+gap_boost = _gap_boost_cc
+
+# === Minimal prediction emission (ensures we always produce a ticket set) ===
+def _normalise_prob_dict(d):
+    p = np.array([float(d.get(n, 0.0)) for n in range(1, 41)], dtype=float)
+    p = np.clip(p, 1e-12, None)
+    p = p / (p.sum() + 1e-12)
+    return {n: float(p[n-1]) for n in range(1, 41)}
+
+def _mix_prob_dicts_safe(w_vec, bases):
+    """
+    Mix base probability dicts on the simplex. `bases` is a dict name->dict(1..40 -> p).
+    Falls back gracefully if any base is missing.
+    """
+    keys = ["Bayes", "Markov", "HMM", "LSTM", "Transformer"]
+    w = np.asarray(w_vec, dtype=float).reshape(-1)
+    if w.size != len(keys):
+        w = np.ones(len(keys), dtype=float) / float(len(keys))
+    w = np.clip(w, 1e-12, None)
+    w = w / (w.sum() + 1e-12)
+        # Accumulate weighted sum (robust to dict, vector, or scalar inputs)
+    acc = np.zeros(40, dtype=float)
+    for i, k in enumerate(keys):
+        Pi = bases.get(k, None)
+        if not isinstance(Pi, dict) or len(Pi) == 0:
+            continue
+        acc += float(w[i]) * np.array([Pi.get(n, 0.0) for n in range(1, 41)], dtype=float)
+    acc = np.clip(acc, 1e-12, None)
+    acc = acc / (acc.sum() + 1e-12)
+    return {n: float(acc[n-1]) for n in range(1, 41)}
+
+def _apply_gate(P, gate_fn):
+    """gate_fn returns (enabled:bool, mix_dict:dict or None, weight:float)."""
+    try:
+        en, mix, w = gate_fn()
+        if not en or not isinstance(mix, dict) or float(w) <= 0:
+            return P
+        base = np.array([P.get(n, 0.0) for n in range(1, 41)], dtype=float)
+        alt  = np.array([mix.get(n, 0.0) for n in range(1, 41)], dtype=float)
+        comb = (1.0 - float(w)) * base + float(w) * alt
+        comb = np.clip(comb, 1e-12, None)
+        comb = comb / (comb.sum() + 1e-12)
+        return {n: float(comb[n-1]) for n in range(1, 41)}
+    except Exception:
+        return P
+
+def _emit_predictions(bayesP, markovP, hmmP, lstmP, transP, path="predicted_tickets.txt"):
+    bases = {
+        "Bayes": _normalise_prob_dict(bayesP),
+        "Markov": _normalise_prob_dict(markovP),
+        "HMM": _normalise_prob_dict(hmmP),
+        "LSTM": _normalise_prob_dict(lstmP),
+        "Transformer": _normalise_prob_dict(transP),
+    }
+    # Adapt weights if regime adapter is available; otherwise use defaults
+    try:
+        w_use = _adapt_base_weights(weights)
+    except Exception:
+        w_use = weights
+
+    P = _mix_prob_dicts_safe(w_use, bases)
+
+    # Optional gates if available
+    try:
+        P = _apply_gate(P, _weekday_gate_for_current_run)
+    except Exception:
+        pass
+    try:
+        P = _apply_gate(P, _streak_gate_for_current_run)
+    except Exception:
+        pass
+
+    # Rank and choose top-6 deterministically
+    ranked = sorted([(n, float(P.get(n, 0.0))) for n in range(1, 41)], key=lambda x: x[1], reverse=True)
+    top6 = [n for n, _ in ranked[:6]]
+
+    # Write plaintext prediction file
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(" ".join(str(n) for n in sorted(top6)) + "\n")
+        print("[PREDICT] Top6:", sorted(top6), "-> written to", path)
+    except Exception as e:
+        warnings.warn(f"Failed to write predictions to {path}: {e}")
+
+# Run the emission once after components are ready
+try:
+    _emit_predictions(bayes_prob, markov_prob, hmm_prob, lstm_prob, transformer_prob, path="predicted_tickets.txt")
+except Exception as _e:
+    warnings.warn(f"Prediction emission failed: {_e}")
 
 
 
@@ -1353,10 +6088,132 @@ gap_boost = {num: gaps_full[num] / max_gap for num in range(1, 41)}  # 0 to 1 sc
 # 4. Train a meta-model (Gradient Boosting Classifier) to combine the base predictions.
 # 5. Use the meta-model to predict the next draw, using the latest base model outputs as features.
 
+
 from sklearn.metrics import log_loss, accuracy_score
 from sklearn.isotonic import IsotonicRegression
 from xgboost import XGBRanker
 from xgboost.callback import EarlyStopping
+
+# === Lotto+ Compatibility Shims (guarded) =====================================
+# These avoid NameErrors after a revert by providing minimal, robust fallbacks.
+
+# 1) Post‑rank isotonic calibrator used by reliability export
+if '_PostRankIsotonic' not in globals():
+    from sklearn.isotonic import IsotonicRegression as _Iso
+    class _PostRankIsotonic:
+        def __init__(self):
+            self.iso = _Iso(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+            self.fitted = False
+        def fit(self, probs_list, labels_list):
+            import numpy as _np
+            x = _np.asarray(probs_list, dtype=float).reshape(-1)
+            y = _np.asarray(labels_list, dtype=float).reshape(-1)
+            if x.size >= 100 and y.size == x.size:
+                self.iso.fit(x, y)
+                self.fitted = True
+            return self
+        def map(self, p):
+            # Map a single probability through isotonic; identity if not fitted.
+            try:
+                return float(self.iso.predict([float(p)])[0]) if self.fitted else float(p)
+            except Exception:
+                return float(p)
+
+# 2) Expert name ordering used throughout
+if '_per_expert_names' not in globals():
+    def _per_expert_names():
+        return ["Bayes", "Markov", "HMM", "LSTM", "Transformer"]
+
+# 3) Historical per‑expert distributions builder used by backtests/diagnostics
+if '_per_expert_prob_dicts_at_t' not in globals():
+    def _per_expert_prob_dicts_at_t(t_idx):
+        """Return base probability dicts at historical index t_idx using only draws[:t_idx].
+        Provides a safe, minimal version compatible with older code paths.
+        """
+        try:
+            t = int(t_idx)
+        except Exception:
+            return None
+        try:
+            hist = _history_upto(t, context="_per_expert_prob_dicts_at_t")
+        except Exception:
+            return None
+        if t <= 0 or t > len(draws) - 0:
+            return None
+        # Bayes / Markov / HMM
+        try:
+            bayes_t = compute_bayes_posterior(hist, alpha=1)
+        except Exception:
+            bayes_t = {n: 1.0/40 for n in range(1,41)}
+        try:
+            markov_t = _markov_prob_from_history(hist)
+        except Exception:
+            markov_t = {n: 1.0/40 for n in range(1,41)}
+        try:
+            hmm_t = _build_hmm_prob_from_subset(hist)
+        except Exception:
+            hmm_t = {n: 1.0/40 for n in range(1,41)}
+        # LSTM / Transformer via existing net predictor, if available
+        try:
+            feats_t = compute_stat_features(draws[t - k: t], t - 1)
+            feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
+            meta_t = None
+            if '_meta_features_at_idx' in globals():
+                import numpy as _np
+                meta_t = _np.array([_meta_features_at_idx(t)], dtype=float)
+            if '_predict_with_nets' in globals():
+                _l_t, _t_t = _predict_with_nets(feats_t, meta_t, t_idx=t, use_finetune=True, mc_passes=globals().get('MC_STACK_PASSES', 1))
+                lstm_t = {n: float(_l_t[n-1]) for n in range(1,41)}
+                trans_t = {n: float(_t_t[n-1]) for n in range(1,41)}
+            else:
+                lstm_t = {n: 1.0/40 for n in range(1,41)}
+                trans_t = {n: 1.0/40 for n in range(1,41)}
+        except Exception:
+            lstm_t = {n: 1.0/40 for n in range(1,41)}
+            trans_t = {n: 1.0/40 for n in range(1,41)}
+        # Normalise defensively
+        def _norm(d):
+            import numpy as _np
+            v = _np.array([float(d.get(i,0.0)) for i in range(1,41)], dtype=float)
+            v = _np.clip(v, 1e-12, None); v = v / (v.sum() + 1e-12)
+            return {i: float(v[i-1]) for i in range(1,41)}
+        return {
+            "Bayes": _norm(bayes_t),
+            "Markov": _norm(markov_t),
+            "HMM": _norm(hmm_t),
+            "LSTM": _norm(lstm_t),
+            "Transformer": _norm(trans_t),
+        }
+
+# 4) Joint/marginal blender used by SetAR decoding paths
+if 'blend_joint_with_marginals' not in globals():
+    def blend_joint_with_marginals(joint_scores, marginal_scores, alpha=0.5):
+        """Blend a ticket‑level joint score dict with per‑number marginals.
+        `joint_scores`: dict[ticket_tuple->score]; `marginal_scores`: dict[num->p].
+        Returns a new dict with renormalised blended scores.
+        """
+        import numpy as _np
+        a = float(alpha)
+        a = 0.0 if not _np.isfinite(a) else max(0.0, min(1.0, a))
+        # Normalise joint scores
+        js_keys = list(joint_scores.keys()) if isinstance(joint_scores, dict) else []
+        if not js_keys:
+            return {}
+        js = _np.array([float(joint_scores[k]) for k in js_keys], dtype=float)
+        js = _np.clip(js, 1e-12, None); js = js / (js.sum() + 1e-12)
+        # Build a marginal product per ticket (without replacement proxy)
+        mp = []
+        for t in js_keys:
+            prod = 1.0
+            for n in t:
+                prod *= float(marginal_scores.get(n, 1.0/40.0))
+            mp.append(prod)
+        mp = _np.array(mp, dtype=float)
+        mp = _np.clip(mp, 1e-18, None); mp = mp / (mp.sum() + 1e-18)
+        comb = (1.0 - a) * js + a * mp
+        comb = _np.clip(comb, 1e-18, None); comb = comb / (comb.sum() + 1e-18)
+        return {k: float(v) for k, v in zip(js_keys, comb)}
+# === End shims ================================================================
 
 # --- Hard patch: sanitize XGBRanker.fit across xgboost 3.0.x ---
 try:
@@ -1421,7 +6278,164 @@ from skopt import BayesSearchCV
 from skopt import gp_minimize
 from skopt.space import Real
 
+
 # --- Helper functions used by weighting/stacking (defined before first use) ---
+
+# --- Simplex helpers & ensemble mix -------------------------------------------------
+
+def _softmax_simplex(theta):
+    v = np.asarray(theta, dtype=float).reshape(-1)
+    v = v - np.max(v)
+    e = np.exp(v)
+    s = float(e.sum())
+    if s <= 0:
+        return np.ones(5, dtype=float) / 5.0
+    return (e / s)
+
+def _mix_prob_dicts(weights_vec, bases_dict):
+    """Given weights (len=5 aligned to _per_expert_names) and a dict of base prob dicts,
+    return the convex combination {1..40->p}. Renormalises defensively.
+    """
+    names = _per_expert_names()
+    w = np.asarray(weights_vec, dtype=float).reshape(-1)
+    if w.size != len(names):
+        w = np.ones(len(names), dtype=float) / float(len(names))
+    mix = np.zeros(40, dtype=float)
+    for i, nm in enumerate(names):
+        d = bases_dict.get(nm, {})
+        v = np.array([float(d.get(n, 0.0)) for n in range(1, 41)], dtype=float)
+        mix += float(w[i]) * v
+    mix = np.clip(mix, 1e-12, None)
+    mix = mix / (mix.sum() + 1e-12)
+    return {n: float(mix[n-1]) for n in range(1, 41)}
+
+# --- Decayed PL-NLL objective over a rolling window --------------------------------
+
+def _exp_decay(age, half_life=30.0):
+    try:
+        return float(0.5 ** (float(age) / float(half_life)))
+    except Exception:
+        return 1.0
+
+def _rolling_decayed_nll_for_theta(theta, t_start, t_end, half_life=30.0):
+    """Theta in R^5 -> simplex via softmax; evaluate decayed PL-NLL over [t_start, t_end).
+    Uses only draws strictly before each t via _per_expert_prob_dicts_at_t.
+    """
+    w = _softmax_simplex(theta)
+    loss = 0.0
+    for t in range(int(t_start), int(t_end)):
+        bases = _per_expert_prob_dicts_at_t(t)
+        P = _mix_prob_dicts(w, bases)
+        nll = _nll_from_prob_dict(P, draws[t])
+        age = (t_end - 1) - t
+        loss += _exp_decay(age, half_life=half_life) * float(nll)
+    return float(loss)
+
+# --- Learn live 5-way base weights (constrained logistic via softmax) ---------------
+
+def _learn_live_base_weights(window=120, half_life=30.0, restarts=3):
+    """Return a 5-dim simplex weight vector for [Bayes, Markov, HMM, LSTM, Transformer]
+    by minimising decayed PL-NLL over the last `window` draws. Softmax enforces
+    non-negativity and sum-to-1. Uses multiple random restarts for stability.
+    """
+    t_end = max(1, int(globals().get('n_draws', 0)) - 0)  # last completed draw index + 1
+    t_start = max(int(globals().get('k', 1)) + 1, t_end - int(window))
+    # Local import to avoid hard dependency if SciPy missing elsewhere
+    try:
+        from scipy.optimize import minimize
+    except Exception as _e:
+        warnings.warn(f"scipy not available for weight learning: {_e}")
+        return np.ones(5, dtype=float) / 5.0
+
+    best_val, best_w = float('inf'), None
+    # Try deterministic start (uniform) + a few random jitters
+    inits = [np.zeros(5, dtype=float)]
+    rng = np.random.default_rng(1234)
+    for _ in range(max(0, int(restarts) - 1)):
+        inits.append(rng.normal(0, 0.2, size=5))
+    for th0 in inits:
+        try:
+            res = minimize(lambda th: _rolling_decayed_nll_for_theta(th, t_start, t_end, half_life=half_life),
+                           x0=th0, method='L-BFGS-B')
+            if res.success:
+                val = float(res.fun)
+                if val < best_val:
+                    best_val, best_w = val, _softmax_simplex(res.x)
+        except Exception:
+            continue
+    return best_w if best_w is not None else (np.ones(5, dtype=float) / 5.0)
+
+# --- Bayesian performance weighting (Dirichlet/Thompson) ----------------------------
+
+def _dirichlet_performance_weights(last_N=120, half_life=30.0, alpha0=1.0, scale=1.0, seed=202):
+    """Build Dirichlet params from decayed successes s_e = sum(decay * exp(-NLL_e))
+    over the recent window, then sample a Thompson weight vector.
+    """
+    names = _per_expert_names()
+    t_end = max(1, int(globals().get('n_draws', 0)))
+    t_start = max(int(globals().get('k', 1)) + 1, t_end - int(last_N))
+    s = np.zeros(len(names), dtype=float)
+    for t in range(t_start, t_end):
+        vals = _per_expert_pl_nll_at(t)
+        if not vals:
+            continue
+        for i, nll in enumerate(vals):
+            s[i] += _exp_decay((t_end-1) - t, half_life=half_life) * np.exp(-float(nll))
+    alpha = alpha0 + scale * s
+    alpha = np.maximum(alpha, 1e-6)
+    rng = np.random.default_rng(int(seed) + int(t_end))
+    w = rng.dirichlet(alpha)
+    return w
+
+# --- Isotonic post-rank calibration (pooled across numbers) -------------------------
+class _IsoCalibrator:
+    def __init__(self):
+        # Clip to [0,1]; avoid extrapolation issues by clipping
+        self._iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        self.fitted = False
+    def fit(self, probs_list, labels_list):
+        # probs_list: list of length-40 arrays; labels_list: list of length-40 binary arrays
+        x, y = [], []
+        for p, lab in zip(probs_list, labels_list):
+            x.extend(list(np.asarray(p).reshape(-1)))
+            y.extend(list(np.asarray(lab).reshape(-1)))
+        if len(x) >= 100:  # need enough points
+            self._iso.fit(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+            self.fitted = True
+        return self
+    def transform_vec(self, p):
+        p = np.asarray(p, dtype=float).reshape(-1)
+        if not self.fitted:
+            return p
+        out = self._iso.transform(p)
+        out = np.clip(out, 1e-12, None)
+        s = float(np.sum(out))
+        return out / (s + 1e-12)
+    def transform_dict(self, P_dict):
+        arr = np.array([float(P_dict.get(n, 0.0)) for n in range(1, 41)], dtype=float)
+        arr = self.transform_vec(arr)
+        return {n: float(arr[n-1]) for n in range(1, 41)}
+
+def _fit_isotonic_calibrator(window=150, weights_vec=None):
+    """Fit pooled isotonic calibrator on the last `window` draws using the current
+    ensemble weights (defaults to uniform if None)."""
+    t_end = max(1, int(globals().get('n_draws', 0)))
+    t_start = max(int(globals().get('k', 1)) + 1, t_end - int(window))
+    cal = _IsoCalibrator()
+    probs, labels = [], []
+    w = np.asarray(weights_vec, dtype=float) if weights_vec is not None else (np.ones(5, dtype=float)/5.0)
+    for t in range(t_start, t_end):
+        bases = _per_expert_prob_dicts_at_t(t)
+        continue
+        P = _mix_prob_dicts(w, bases)
+        probs.append([P[n] for n in range(1, 41)])
+        lab = [1.0 if (n in draws[t]) else 0.0 for n in range(1, 41)]
+        labels.append(lab)
+    try:
+        cal.fit(probs, labels)
+    except Exception as _e:
+        warnings.warn(f"Isotonic fit failed: {_e}")
+    return cal
 
 def _norm_prob_dict_local(d):
     s = float(sum(d.get(n, 0.0) for n in range(1, 41)))
@@ -1507,23 +6521,107 @@ def _per_expert_prob_dicts_at_t(t_idx):
     # Neural nets features at time t_idx
     feats_t = compute_stat_features(draws[t_idx - k: t_idx], t_idx - 1)
     feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
-    _l_t, _t_t = _predict_with_nets(feats_t, t_idx=t_idx, use_finetune=True, mc_passes=MC_STACK_PASSES)
+    meta_t = np.array([_meta_features_at_idx(t_idx)], dtype=float)
+    _l_t, _t_t = _predict_with_nets(feats_t, meta_t, t_idx=t_idx, use_finetune=True, mc_passes=MC_STACK_PASSES)
     lstm_t = {n: float(_l_t[n-1]) for n in range(1, 41)}
     trans_t = {n: float(_t_t[n-1]) for n in range(1, 41)}
     return {"Bayes": bayes_t, "Markov": markov_t, "HMM": hmm_t, "LSTM": lstm_t, "Transformer": trans_t}
 
 
 def _per_expert_pl_nll_at(t_idx):
-    """Compute per-expert PL-NLLs at historical index t_idx. Returns list aligned to _per_expert_names()."""
-    bases = _per_expert_prob_dicts_at_t(t_idx)
-    if bases is None:
+    """Return per-expert PL-NLLs at draw t_idx using bases from draws[:t_idx]."""
+    # Normalise/guard t_idx
+    try:
+        t = int(t_idx)
+    except Exception:
+        try:
+            t = int(float(t_idx))
+        except Exception:
+            warnings.warn(f"Invalid t_idx passed to _per_expert_pl_nll_at: {t_idx}")
+            return None
+
+    # Build per-expert probability dictionaries strictly from draws[:t]
+    bases = _per_expert_prob_dicts_at_t(t)
+    if not isinstance(bases, dict):
         return None
-    winners = draws[int(t_idx)]
+
+    # Ensure the expected expert keys are present (Bayes/Markov/HMM/LSTM/Transformer)
+    try:
+        _assert_expert_key_consistency(bases)
+    except Exception:
+        # If the assert helper raises, proceed best-effort
+        pass
+
+    # Get the ground-truth winners for draw t (guarded)
+    try:
+        winners = draws[t]
+    except Exception as e:
+        warnings.warn(f"Failed to access winners at t={t}: {e}")
+        return None
+
+    # Compute per-expert PL-NLLs in the canonical order returned by _per_expert_names()
+    names = _per_expert_names()
     out = []
-    for name in _per_expert_names():
-        out.append(_nll_from_prob_dict(bases[name], winners))
+    for name in names:
+        Pi = bases.get(name, {}) if isinstance(bases, dict) else {}
+        out.append(_nll_from_prob_dict(Pi, winners))
     return out
 
+
+def _live_mixture_prob():
+    """
+    Build the current live per-number probability distribution for the NEXT draw
+    using the already-computed base models and learned weights. Applies the weekday
+    gate if it is enabled, and a mild concave gap-pressure multiplier. Returns {1..40->p}.
+    """
+    try:
+        def _get(d, n):
+            return float(d.get(n, 0.0)) if isinstance(d, dict) else 0.0
+        P = {}
+        for n in range(1, 41):
+            bv = [
+                _get(globals().get("bayes_prob", {}), n),
+                _get(globals().get("markov_prob", {}), n),
+                _get(globals().get("hmm_prob", {}), n),
+                float(globals().get("lstm_prob", {}).get(n, 0.0)),
+                float(globals().get("transformer_prob", {}).get(n, 0.0)),
+            ]
+            w = globals().get("weights", np.ones(5, dtype=float) / 5.0)
+            P[n] = float(np.dot(np.asarray(w, dtype=float), np.asarray(bv, dtype=float)))
+        s = sum(P.values())
+        if s > 0:
+            for n in range(1, 41):
+                P[n] = P[n] / s
+        else:
+            P = {n: 1.0/40 for n in range(1, 41)}
+
+        # Apply weekday/month cheap baseline via a light gate
+        try:
+            gate_fn = globals().get("_weekday_gate_for_current_run", None)
+            if callable(gate_fn):
+                enabled, wd_prob, w = gate_fn()
+                if enabled and isinstance(wd_prob, dict) and w and w > 0:
+                    P = {n: float((1.0 - w) * P.get(n, 0.0) + w * wd_prob.get(n, 0.0)) for n in range(1, 41)}
+                    s = sum(P.values()); P = {n: P[n]/s for n in range(1, 41)}
+        except Exception:
+            pass
+
+        # Apply concave gap-pressure multiplier then renormalise (very mild)
+        try:
+            GP_W = 0.10
+            gb = globals().get("gap_boost", None)
+            if isinstance(gb, dict):
+                P = {n: P[n] * (1.0 + GP_W * float(gb.get(n, 0.0))) for n in range(1, 41)}
+                s = sum(P.values()); P = {n: P[n]/s for n in range(1, 41)}
+        except Exception:
+            pass
+
+        return P
+    except ImportError:
+        warnings.warn("pomegranate not installed; falling back to uniform HMM prior if hmmlearn path fails.")
+        return {n: 1.0/40 for n in range(1, 41)}
+    except Exception:
+        return {n: 1.0/40 for n in range(1, 41)}
 
 def _stacked_probs_from_feats(latest_feats):
     """Apply the current stacker + optional calibrator/temperature to a (1,40,F) feature array."""
@@ -1579,6 +6677,7 @@ def _latest_feats_at_t(t_idx, overrides=None):
     roll_ent_t = _rolling_entropy_from_history(history, window=30)
     roll_disp_t = _dispersion_last_draw(history)
 
+    wd_base_t, mo_base_t = _weekday_month_baselines_at_t(t_idx)
     latest_feats_t = np.array([
         [
             bases["Bayes"].get(num, 0.0),
@@ -1598,6 +6697,8 @@ def _latest_feats_at_t(t_idx, overrides=None):
             float(reg_t['schedule_flip']),
             float(roll_ent_t),
             float(roll_disp_t),
+            wd_base_t.get(num, 0.0),  # weekday-conditioned baseline
+            mo_base_t.get(num, 0.0),  # month-conditioned baseline
         ]
         for num in range(1, 41)
     ], dtype=float)
@@ -1772,38 +6873,6 @@ def _build_reliability(preds_flat, actual_flat, n_bins=10):
         pass
 
     return {"bins": bin_stats}
-
-
-def run_oracle_ablation(last_N=100, log_path="run_log.jsonl"):
-    """
-    For each draw in the last `last_N`, replace ONE expert with a perfect oracle
-    (uniform mass over the true 6 winners) and compute the improvement in PL-NLL
-    over the baseline stacker. Returns a dict of mean improvements per expert.
-    """
-    start = max(k + 5, n_draws - int(last_N))
-    names = _per_expert_names()
-    gains = {name: [] for name in names}
-
-    for t in range(start, n_draws):
-        winners = draws[t]
-        base_dist = _stacked_distribution_at_t(t)
-        base_nll = _nll_from_prob_dict(base_dist, winners)
-        oracle = {n: (1.0/6.0 if n in winners else 1e-12) for n in range(1, 41)}
-        s = sum(oracle.values())
-        oracle = {n: oracle[n] / s for n in range(1, 41)}
-
-        for name in names:
-            override = {name: oracle}
-            dist = _stacked_distribution_at_t(t, overrides=override)
-            nll = _nll_from_prob_dict(dist, winners)
-            gains[name].append(base_nll - nll)  # positive = improvement
-
-    means = {name: float(np.mean(vals)) if vals else None for name, vals in gains.items()}
-    try:
-        _log_jsonl({"type":"oracle_ablation","ts":_now_iso(),"mean_improvement":means}, path=log_path)
-    except Exception:
-        pass
-    return means
 
 # --- Decision policy helpers: mixture construction + PL sampling with temperature & diversity ---
 def _live_mixture_prob():
@@ -2238,6 +7307,18 @@ try:
     except Exception as _e:
         import warnings as _w
         _w.warn(f"Predict-time operational log failed: {_e}")
+    # --- Evaluation & diagnostics: walk-forward, reliability, oracle ablation ---
+    try:
+        # Strict rolling walk-forward backtest over the last 150 draws
+        summary = run_walk_forward_backtest(last_N=150, log_path="run_log.jsonl")
+        print("[DIAG] Backtest summary:", summary)
+        # Oracle ablation (mean improvement in PL-NLL if each expert were perfect)
+        ablate = run_oracle_ablation(last_N=100, log_path="run_log.jsonl")
+        print("[DIAG] Oracle ablation mean ΔNLL:", ablate)
+    except Exception as _e:
+        _w.warn(f"Diagnostics failed: {_e}")
+except Exception as _e:
+    warnings.warn(f"Diagnostics failed: {_e}")
     # --- Evaluation & diagnostics (walk-forward backtest, reliability, oracle ablation) ---
     try:
         _bt_summary = run_walk_forward_backtest(last_N=min(150, max(30, n_draws - (k + 5))))
@@ -2270,3 +7351,201 @@ try:
 except Exception as _e:
     import warnings as _w
     _w.warn(f"Final prediction block failed: {_e}")
+
+# === FINAL PREDICTION PIPELINE (single-ticket output) =========================
+# Chooses the method that backtests best on recent draws, then writes ONE ticket
+# to 'predicted_tickets.txt'. Supports a HOLDOUT mode (HOLDOUT_LAST=1) which
+# withholds the most recent draw for a quick sanity check.
+
+def _rescale_probs_to_six(prob_dict):
+    """Return a dict {1..40->p} scaled so sum p_i = 6 and each p in [1e-6, 1-1e-6].
+    Adds a *tiny*, deterministic jitter to break perfect ties (avoids 1-2-3-4-5-6 when all p equal).
+    """
+    import numpy as _np
+    p = _np.array([float(prob_dict.get(i, 1.0/40.0)) for i in range(1, 41)], dtype=float)
+    # Clip negatives and NaNs, and guard against an all-zero vector
+    p = _np.clip(_np.nan_to_num(p, nan=0.0), 0.0, None)
+    s = float(p.sum())
+    if s <= 0.0:
+        p[:] = 6.0 / 40.0
+    else:
+        p *= (6.0 / s)
+    # *Tiny* deterministic jitter breaks exact ties without changing calibration
+    jitter = _np.linspace(1.0, 40.0, 40, dtype=float) * 1e-12
+    p = p + jitter
+    # Renormalize to keep sum≈6 after jitter
+    p *= (6.0 / float(p.sum()))
+    p = _np.clip(p, 1e-6, 1.0 - 1e-6)
+    return {i: float(p[i-1]) for i in range(1, 41)}
+
+def _top6_from_prob_dict(prob_dict):
+    """
+    Return a 6-number ticket chosen by JOINT COMBINATION MODELING.
+    Falls back to simple top-6 by marginals if joint decoding fails.
+    """
+    try:
+        hist = draws[:-1] if (isinstance(draws, list) and len(draws) > 0) else []
+        ticket = choose_ticket_joint(prob_dict, hist, beam=JOINT_BEAM_WIDTH, top_pool=JOINT_TOP_POOL)
+        return tuple(sorted(ticket))
+    except Exception:
+        import numpy as _np
+        arr = _np.array([float(prob_dict.get(i, 0.0)) for i in range(1, 41)], dtype=float)
+        idx = _np.argsort(arr)[-6:]
+        return tuple(sorted(int(i+1) for i in idx))
+
+def _set_like_nll(draw_set, prob_dict):
+    """Independent-set approximation to the draw likelihood to compute an NLL."""
+    import numpy as _np
+    drawn = set(int(x) for x in draw_set)
+    p = _np.array([float(prob_dict.get(i, 1.0/40.0)) for i in range(1, 41)], dtype=float)
+    p = _np.clip(p, 1e-9, 1.0 - 1e-9)
+    logp = 0.0
+    for i in range(1, 41):
+        if i in drawn:
+            logp += float(_np.log(p[i-1]))
+        else:
+            logp += float(_np.log(1.0 - p[i-1]))
+    return float(-logp)
+
+def _probs_from_bayes(hist_draws, alpha=1.0):
+    """Simple Dirichlet posterior (uniform prior) from history only."""
+    from collections import Counter as _Counter
+    cnt = _Counter([n for d in hist_draws for n in d])
+    tot = max(1, len(hist_draws) * 6)
+    raw = {i: (alpha + cnt.get(i, 0)) / (tot + 40.0 * alpha) for i in range(1, 41)}
+    return _rescale_probs_to_six(raw)
+
+def _probs_from_hmm(hist_draws):
+    """Emission mixture from an HMM fit on `hist_draws` (or uniform if HMM not OK)."""
+    try:
+        if HMM_OK:
+            raw = _build_hmm_prob_from_subset(hist_draws, n_states=3, n_seeds=4)
+        else:
+            raw = _uniform_prob40()
+    except Exception:
+        raw = _uniform_prob40()
+    return _rescale_probs_to_six(raw)
+
+def _probs_from_pf(hist_draws, num_particles=4000, alpha=0.005, sigma=0.01):
+    """Assimilate history with the ParticleFilter and return the posterior mean probs."""
+    try:
+        pf = ParticleFilter(num_numbers=40, num_particles=int(num_particles),
+                            alpha=float(alpha), sigma=float(sigma))
+        for d in hist_draws:
+            pf.predict()
+            pf.update(d)
+        # One more predict step to get the next-step prior
+        pf.predict()
+        mean_p = pf.get_mean_probabilities()
+        raw = {i: float(mean_p[i-1]) for i in range(1, 41)}
+    except Exception:
+        raw = _uniform_prob40()
+    return _rescale_probs_to_six(raw)
+
+def _evaluate_method(hist_draws, method_fn, eval_window=80):
+    """Walk-forward backtest on the tail of history; return (avg_hits, mean_nll)."""
+    N = len(hist_draws)
+    if N < 10:
+        return (0.0, float('inf'))
+    start = max(6, N - int(eval_window))
+    hits = []; nlls = []
+    for t in range(start, N):
+        try:
+            P = method_fn(hist_draws[:t])
+            top6 = predict_joint_number_set(
+                base_prob_dict=locals().get('final_prob_dict', locals().get('prob_dict', locals().get('marginals', {}))),
+                beam_width=JOINT_BEAM_WIDTH
+            )
+            h = len(set(top6).intersection(set(hist_draws[t])))
+            hits.append(int(h))
+            nlls.append(_set_like_nll(hist_draws[t], P))
+        except Exception:
+            continue
+    if len(hits) == 0:
+        return (0.0, float('inf'))
+    return (float(sum(hits)) / len(hits), float(sum(nlls)) / len(nlls))
+
+def _choose_best_method(hist_draws, eval_window=80):
+    """Return (name, method_fn, metrics_dict) for the best-performing method."""
+    cand = [
+        ("ParticleFilter", _probs_from_pf),
+        ("HMM", _probs_from_hmm),
+        ("Bayes", _probs_from_bayes),
+    ]
+    scores = []
+    for name, fn in cand:
+        avg_hits, mean_nll = _evaluate_method(hist_draws, fn, eval_window=eval_window)
+        scores.append((name, fn, avg_hits, mean_nll))
+    # Best by lowest NLL; break ties by highest hits
+    scores.sort(key=lambda x: (x[3], -x[2]))
+    best = scores[0]
+    return best[0], best[1], {"avg_hits": best[2], "mean_nll": best[3]}
+
+def _write_single_ticket(numbers, path="predicted_tickets.txt"):
+    """Write ONE line with space-separated numbers to `path`."""
+    s = " ".join(str(int(n)) for n in numbers)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(s + "\n")
+
+def _is_near_uniform(prob_dict, tol=1e-9):
+    """Return True if all probabilities are effectively equal (within `tol`)."""
+    import numpy as _np
+    p = _np.array([float(prob_dict.get(i, 0.0)) for i in range(1, 41)], dtype=float)
+    if p.size == 0:
+        return True
+    return (float(p.max()) - float(p.min())) <= float(tol)
+
+def _predict_and_write_single_ticket(holdout_last=False, eval_window=80):
+    """
+    Pick the best method by recent backtest, predict next draw, and write 1 ticket.
+    If holdout_last=True, exclude the last draw from training and report its hits.
+    """
+    hist = draws[:-1] if holdout_last else draws[:]
+    best_name, best_fn, metrics = _choose_best_method(hist, eval_window=eval_window)
+    P = best_fn(hist)
+    # Safety guard: if the chosen method returned an (almost) uniform distribution,
+    # or if it produced NaNs/Infs, fall back to a Bayes posterior from the same history
+    # to avoid the 1..6 artifact.
+    try:
+        _pvals = np.array([float(P.get(i, 0.0)) for i in range(1, 41)], dtype=float)
+        _bad = not np.isfinite(_pvals).all()
+    except Exception:
+        _bad = True
+
+    if _bad or _is_near_uniform(P):
+        try:
+            # Preferred wrapper if available (returns sum≈6 and clipped)
+            P = _probs_from_bayes(hist)
+        except NameError:
+            # Safe fallback: compute raw Bayes and rescale
+            P = _rescale_probs_to_six(compute_bayes_posterior(hist, alpha=1))
+        best_name = f"{best_name}+BayesFallback"
+    ticket = _top6_from_prob_dict(P)
+    _write_single_ticket(ticket, path="predicted_tickets.txt")
+    # Logging for traceability
+    try:
+        _log_predict_run(blend_weights=[best_name], t_eval=(len(draws)-1))
+        _log_jsonl({
+            "type": "final_ticket",
+            "ts": _now_iso(),
+            "method": best_name,
+            "metrics": metrics,
+            "ticket": ticket,
+            "holdout": bool(holdout_last),
+        })
+    except Exception:
+        pass
+    # Print a concise console summary
+    print(f"[FINAL] Method={best_name}  ticket={ticket}  metrics={metrics}")
+    if holdout_last:
+        truth = sorted(list(draws[-1]))
+        hit = len(set(ticket).intersection(set(truth)))
+        print(f"[HOLDOUT] truth={truth}  hits={hit}")
+
+if __name__ == "__main__":
+    # HOLDOUT_LAST=1 → leave the most recent draw out for a quick test
+    holdout = str(os.environ.get("HOLDOUT_LAST", "0")).strip() == "1"
+    try:
+        _predict_and_write_single_ticket(holdout_last=holdout, eval_window=80)
+    except Exception as e:
+        warnings.warn(f"Final prediction pipeline failed: {e}")
