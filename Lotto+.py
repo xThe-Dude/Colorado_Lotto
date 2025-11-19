@@ -995,7 +995,7 @@ def _summarise_calibrator():
 
 def _per_expert_names():
     # Names must match keys returned by _per_expert_prob_dicts_at_t()
-    return ["Bayes", "Markov", "HMM", "LSTM", "Transformer"]
+    return ["Bayes", "Markov", "HMM", "LSTM", "Transformer", "GNN"]
 
 def _assert_expert_key_consistency(bases_or_logs):
     """
@@ -3768,6 +3768,272 @@ def build_transformer_model(input_shape, output_dim, num_heads=4, ff_dim=96, met
     return model
 
 
+# === Graph Neural Network (GNN) Expert =========================================
+# GNN models co-occurrence relationships between numbers as a graph structure.
+# Nodes: 40 lottery numbers (1-40)
+# Edges: Co-occurrence relationships weighted by frequency and recency
+# Architecture: Graph Convolutional Network (GCN) with multiple message passing layers
+
+def build_cooccurrence_graph(hist_draws, window=30, min_cooc=2):
+    """
+    Build adjacency matrix from co-occurrence patterns in historical draws.
+
+    Args:
+        hist_draws: List of draws (each draw is a set/list of numbers)
+        window: Number of recent draws to consider
+        min_cooc: Minimum co-occurrences to create an edge
+
+    Returns:
+        adj_matrix: (40, 40) symmetric adjacency matrix with co-occurrence weights
+        node_features: (40, feature_dim) node features for each number
+    """
+    import numpy as np_
+    from collections import Counter
+    from itertools import combinations
+
+    # Use recent draws for graph construction
+    recent = hist_draws[-window:] if len(hist_draws) > window else hist_draws
+    if len(recent) == 0:
+        # Return uniform graph if no history
+        adj = np_.ones((40, 40), dtype=float) * 0.1
+        np_.fill_diagonal(adj, 1.0)
+        return adj, np_.ones((40, 5), dtype=float) * 0.5
+
+    # Count co-occurrences (pairs appearing in same draw)
+    cooc_counts = Counter()
+    for draw in recent:
+        draw_list = sorted(list(draw))
+        for a, b in combinations(draw_list, 2):
+            # Store as sorted tuple
+            pair = (min(a, b), max(a, b))
+            cooc_counts[pair] += 1
+
+    # Build adjacency matrix (40x40)
+    adj = np_.zeros((40, 40), dtype=float)
+    max_cooc = max(cooc_counts.values()) if cooc_counts else 1
+
+    for (a, b), count in cooc_counts.items():
+        if count >= min_cooc:
+            # Normalize by max and add to adjacency
+            weight = float(count) / max_cooc
+            adj[a-1, b-1] = weight
+            adj[b-1, a-1] = weight  # Symmetric
+
+    # Add self-loops
+    np_.fill_diagonal(adj, 1.0)
+
+    # Normalize adjacency matrix (D^-0.5 * A * D^-0.5 for GCN)
+    degree = np_.sum(adj, axis=1)
+    degree = np_.where(degree > 0, degree, 1.0)  # Avoid division by zero
+    d_inv_sqrt = np_.power(degree, -0.5)
+    d_mat_inv_sqrt = np_.diag(d_inv_sqrt)
+    adj_normalized = d_mat_inv_sqrt @ adj @ d_mat_inv_sqrt
+
+    # Build node features
+    node_features = _build_graph_node_features(hist_draws, window)
+
+    return adj_normalized, node_features
+
+
+def _build_graph_node_features(hist_draws, window=30):
+    """Build per-node features for GNN."""
+    import numpy as np_
+    from collections import Counter
+
+    recent = hist_draws[-window:] if len(hist_draws) > window else hist_draws
+    if len(recent) == 0:
+        return np_.ones((40, 5), dtype=float) * 0.5
+
+    # Feature 1: Frequency in recent window
+    freq_counts = Counter([n for d in recent for n in d])
+    max_freq = max(freq_counts.values()) if freq_counts else 1
+    frequencies = np_.array([freq_counts.get(i, 0) / max_freq for i in range(1, 41)], dtype=float)
+
+    # Feature 2: Recency (draws since last appearance)
+    recency = np_.zeros(40, dtype=float)
+    for i in range(1, 41):
+        for idx, draw in enumerate(reversed(recent)):
+            if i in draw:
+                recency[i-1] = 1.0 / (idx + 1)  # More recent = higher value
+                break
+
+    # Feature 3: Degree centrality (number of co-occurrence partners)
+    degree = np_.zeros(40, dtype=float)
+    for draw in recent:
+        draw_list = list(draw)
+        for n in draw_list:
+            degree[n-1] += len(draw_list) - 1  # Number of partners in this draw
+    degree = degree / (degree.max() + 1e-9)
+
+    # Feature 4: Low/High position (1-20 vs 21-40)
+    position = np_.array([1.0 if i <= 20 else 0.0 for i in range(1, 41)], dtype=float)
+
+    # Feature 5: Number identity (normalized)
+    identity = np_.linspace(0, 1, 40, dtype=float)
+
+    # Stack features: (40, 5)
+    node_feats = np_.stack([frequencies, recency, degree, position, identity], axis=1)
+    return node_feats
+
+
+class GraphConvLayer(layers.Layer):
+    """Custom Graph Convolutional Layer for GNN."""
+
+    def __init__(self, units, activation='relu', dropout=0.2, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.activation = activation
+        self.dropout_rate = dropout
+        self.dense = None
+        self.dropout_layer = None
+
+    def build(self, input_shape):
+        # input_shape: [(batch, N, F), (batch, N, N)] where N=40 nodes
+        self.dense = layers.Dense(self.units, activation=self.activation)
+        self.dropout_layer = layers.Dropout(self.dropout_rate)
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        x, adj = inputs  # x: (batch, 40, F), adj: (batch, 40, 40)
+
+        # Graph convolution: adj @ x @ W
+        # adj @ x: (batch, 40, 40) @ (batch, 40, F) = (batch, 40, F)
+        aggregated = tf.matmul(adj, x)  # Aggregate neighbor features
+
+        # Apply dense layer
+        out = self.dense(aggregated)
+
+        # Dropout
+        out = self.dropout_layer(out, training=training)
+
+        return out
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'units': self.units,
+            'activation': self.activation,
+            'dropout': self.dropout_rate,
+        })
+        return config
+
+
+def build_gnn_model(num_nodes=40, node_feature_dim=5, meta_dim=3,
+                    hidden_dims=[64, 64, 32], final_dropout=0.35):
+    """
+    Build a Graph Neural Network for lottery prediction.
+
+    Args:
+        num_nodes: Number of nodes (40 for lottery numbers 1-40)
+        node_feature_dim: Dimension of node features
+        meta_dim: Dimension of meta features (weekday, entropy, dispersion)
+        hidden_dims: List of hidden layer dimensions
+        final_dropout: Dropout rate before output layer
+
+    Returns:
+        Compiled Keras model
+    """
+    # Inputs
+    node_features = layers.Input(shape=(num_nodes, node_feature_dim), name="node_features")
+    adj_matrix = layers.Input(shape=(num_nodes, num_nodes), name="adj_matrix")
+    meta_in = layers.Input(shape=(meta_dim,), name="meta_inputs")
+
+    # Graph convolutional layers
+    x = node_features
+    for hidden_dim in hidden_dims:
+        x = GraphConvLayer(hidden_dim, activation='relu', dropout=0.2)([x, adj_matrix])
+        x = layers.LayerNormalization()(x)  # Normalize after each GCN layer
+
+    # Global pooling to get graph-level representation
+    g = layers.GlobalAveragePooling1D()(x)  # (batch, hidden_dim)
+
+    # Meta feature head
+    m = layers.Dense(16, activation='relu')(meta_in)
+    m = layers.Dense(16, activation='relu')(m)
+
+    # Combine graph representation with meta features
+    g = layers.Concatenate()([g, m])
+    g = layers.Dense(64, activation='relu')(g)
+
+    # Broadcast back to node level
+    g_rep = layers.RepeatVector(num_nodes)(g)  # (batch, 40, 64)
+
+    # Combine with node-level features
+    x = layers.Concatenate(axis=-1)([x, g_rep])  # (batch, 40, hidden_dim + 64)
+
+    # Final MLP for per-node prediction
+    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dense(32, activation='relu')(x)
+    x = layers.Dropout(final_dropout)(x)
+
+    # Output logits for each node (number)
+    logits = layers.Conv1D(1, kernel_size=1)(x)  # (batch, 40, 1)
+    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)  # (batch, 40)
+
+    # Build model
+    model = keras.Model(
+        inputs=[node_features, adj_matrix, meta_in],
+        outputs=logits,
+        name="GNN_Lottery_Predictor"
+    )
+
+    # Compile with same loss as other models
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+        loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+    )
+
+    return model
+
+
+def _gnn_prob_from_history(hist_draws, gnn_model=None, meta_features=None):
+    """
+    Predict probabilities using GNN model.
+
+    Args:
+        hist_draws: Historical draws
+        gnn_model: Trained GNN model (if None, returns uniform)
+        meta_features: Meta features (weekday, entropy, dispersion)
+
+    Returns:
+        Dictionary {1..40 -> probability}
+    """
+    import numpy as np_
+
+    if gnn_model is None or len(hist_draws) < 10:
+        # Return uniform if model not available
+        return {i: 1.0/40 for i in range(1, 41)}
+
+    try:
+        # Build graph from history
+        adj, node_feats = build_cooccurrence_graph(hist_draws, window=30)
+
+        # Prepare inputs
+        adj_batch = np_.expand_dims(adj, axis=0)  # (1, 40, 40)
+        node_batch = np_.expand_dims(node_feats, axis=0)  # (1, 40, 5)
+
+        # Meta features (default if not provided)
+        if meta_features is None:
+            meta_features = np_.array([[0.0, 0.5, 0.5]], dtype=float)  # (1, 3)
+        elif meta_features.ndim == 1:
+            meta_features = np_.expand_dims(meta_features, axis=0)
+
+        # Predict
+        logits = gnn_model.predict([node_batch, adj_batch, meta_features], verbose=0)
+        logits = logits.reshape(-1)  # (40,)
+
+        # Convert logits to probabilities
+        probs = 1.0 / (1.0 + np_.exp(-logits))
+        probs = np_.clip(probs, 1e-12, 1 - 1e-12)
+        probs = probs / (probs.sum() + 1e-12)
+
+        return {i: float(probs[i-1]) for i in range(1, 41)}
+
+    except Exception as e:
+        warnings.warn(f"GNN prediction failed: {e}")
+        return {i: 1.0/40 for i in range(1, 41)}
+
+
 # --- Joint (exact-ticket) scoring helpers -------------------------------------
 
 # === Set-AR beam search and joint combinator (new) ===========================
@@ -4892,6 +5158,62 @@ transformer_model.fit(
     verbose=2
 )
 
+# Train GNN Model
+print("Training GNN model...")
+# Prepare graph data for GNN training
+def prepare_gnn_data(start_idx, end_idx):
+    """Prepare adjacency matrices and node features for GNN training."""
+    adj_list = []
+    node_feat_list = []
+    meta_list = []
+    y_list = []
+
+    for idx in range(start_idx, end_idx):
+        if idx < k:
+            continue
+        # Build graph from history up to idx-1
+        hist = draws[:idx]
+        try:
+            adj, node_feats = build_cooccurrence_graph(hist, window=30)
+            adj_list.append(adj)
+            node_feat_list.append(node_feats)
+            meta_list.append(_meta_features_at_idx(idx-1))
+            y_list.append([1 if num in draws[idx] else 0 for num in range(1, 41)])
+        except Exception as e:
+            warnings.warn(f"Failed to build graph for idx {idx}: {e}")
+            continue
+
+    if len(adj_list) == 0:
+        return None, None, None, None
+
+    return (np.array(adj_list), np.array(node_feat_list),
+            np.array(meta_list), np.array(y_list))
+
+# Prepare GNN training data
+gnn_train_idx_start = k
+gnn_train_idx_end = k + int((n_draws - k - 1) * 0.8)
+gnn_val_idx_start = gnn_train_idx_end
+gnn_val_idx_end = n_draws - 1
+
+A_train_gnn, NF_train_gnn, M_train_gnn, y_train_gnn = prepare_gnn_data(gnn_train_idx_start, gnn_train_idx_end)
+A_val_gnn, NF_val_gnn, M_val_gnn, y_val_gnn = prepare_gnn_data(gnn_val_idx_start, gnn_val_idx_end)
+
+if A_train_gnn is not None and A_val_gnn is not None:
+    gnn_model = build_gnn_model(num_nodes=40, node_feature_dim=5, meta_dim=3,
+                                 hidden_dims=[64, 64, 32], final_dropout=0.35)
+    gnn_model.fit(
+        [NF_train_gnn, A_train_gnn, M_train_gnn], y_train_gnn,
+        validation_data=([NF_val_gnn, A_val_gnn, M_val_gnn], y_val_gnn),
+        epochs=300,
+        batch_size=8,
+        callbacks=[early_stop, reduce_lr],
+        verbose=2
+    )
+    print("GNN model training complete.")
+else:
+    print("Warning: Could not prepare GNN training data. GNN will use uniform predictions.")
+    gnn_model = None
+
 
 # ================================================================
 # Expanding-window fine-tuning for neural nets (every 8 draws)
@@ -5025,16 +5347,20 @@ _set_target_idx(None)
 
 lstm_prob = None
 transformer_prob = None
+gnn_prob = None
 # Use expanding-window fine-tuned nets for the latest prediction
 _l_probs, _t_probs = _predict_with_nets(features_pred, meta_pred, t_idx=n_draws, use_finetune=True, mc_passes=21)
 lstm_prob = {num: float(_l_probs[num-1]) for num in range(1, 41)}
 transformer_prob = {num: float(_t_probs[num-1]) for num in range(1, 41)}
 
+# GNN prediction for the next draw
+gnn_prob = _gnn_prob_from_history(draws, gnn_model=globals().get('gnn_model', None), meta_features=meta_pred[0])
+
 # --- Default equal weights for bases (prevent NameError during logging/mixing) ---
 try:
     weights  # if already defined elsewhere, keep it
 except NameError:
-    weights = np.ones(5, dtype=float) / 5.0  # [Bayes, Markov, HMM, LSTM, Transformer]
+    weights = np.ones(6, dtype=float) / 6.0  # [Bayes, Markov, HMM, LSTM, Transformer, GNN]
 
 # Provide a no-op regime adapter if not defined elsewhere
 if "_adapt_base_weights" not in globals():
@@ -5778,6 +6104,7 @@ compat_bayes   = _compat_topk_sum(bayes_prob, k=COMP_K)
 compat_markov  = _compat_topk_sum(markov_prob, k=COMP_K)
 compat_hmm     = _compat_topk_sum(hmm_prob, k=COMP_K)
 compat_nn      = _compat_topk_sum({n: 0.5*lstm_prob[n] + 0.5*transformer_prob[n] for n in range(1, 41)}, k=COMP_K)
+compat_gnn     = _compat_topk_sum(gnn_prob, k=COMP_K)
 
 
 
@@ -5819,13 +6146,16 @@ def _adapt_base_weights(weights_vec):
     """
     try:
         w = np.asarray(weights_vec, dtype=float).reshape(-1)
-        if w.size < 5:
-            return np.ones(5, dtype=float) / 5.0
+        if w.size < 6:
+            # Pad to 6 if needed
+            w_new = np.ones(6, dtype=float) / 6.0
+            w_new[:w.size] = w[:min(w.size, 6)]
+            w = w_new
         flags = _regime_switch_flags()
         if flags['entropy_jump'] or flags['cadence_perturbed']:
-            # indices: 0=Bayes, 1=Markov, 2=HMM, 3=LSTM, 4=Transformer
-            mult = np.array([1.25, 0.85, 0.90, 1.00, 1.00], dtype=float)
-            w = w * mult
+            # indices: 0=Bayes, 1=Markov, 2=HMM, 3=LSTM, 4=Transformer, 5=GNN
+            mult = np.array([1.25, 0.85, 0.90, 1.00, 1.00, 1.05], dtype=float)
+            w = w[:6] * mult  # Ensure we only use first 6 elements
         w = np.clip(w, 1e-12, None)
         w = w / (w.sum() + 1e-12)
         return w
@@ -6525,7 +6855,12 @@ def _per_expert_prob_dicts_at_t(t_idx):
     _l_t, _t_t = _predict_with_nets(feats_t, meta_t, t_idx=t_idx, use_finetune=True, mc_passes=MC_STACK_PASSES)
     lstm_t = {n: float(_l_t[n-1]) for n in range(1, 41)}
     trans_t = {n: float(_t_t[n-1]) for n in range(1, 41)}
-    return {"Bayes": bayes_t, "Markov": markov_t, "HMM": hmm_t, "LSTM": lstm_t, "Transformer": trans_t}
+
+    # GNN prediction
+    gnn_t = _gnn_prob_from_history(history, gnn_model=globals().get('gnn_model', None), meta_features=meta_t[0])
+    gnn_t = _norm_prob_dict_local(gnn_t)
+
+    return {"Bayes": bayes_t, "Markov": markov_t, "HMM": hmm_t, "LSTM": lstm_t, "Transformer": trans_t, "GNN": gnn_t}
 
 
 def _per_expert_pl_nll_at(t_idx):
@@ -6585,8 +6920,9 @@ def _live_mixture_prob():
                 _get(globals().get("hmm_prob", {}), n),
                 float(globals().get("lstm_prob", {}).get(n, 0.0)),
                 float(globals().get("transformer_prob", {}).get(n, 0.0)),
+                _get(globals().get("gnn_prob", {}), n),
             ]
-            w = globals().get("weights", np.ones(5, dtype=float) / 5.0)
+            w = globals().get("weights", np.ones(6, dtype=float) / 6.0)
             P[n] = float(np.dot(np.asarray(w, dtype=float), np.asarray(bv, dtype=float)))
         s = sum(P.values())
         if s > 0:
@@ -6673,6 +7009,7 @@ def _latest_feats_at_t(t_idx, overrides=None):
     compat_hmm_t    = _compat_topk_sum(bases["HMM"],         k=compat_k)
     nn_t = {n: 0.5*bases["LSTM"][n] + 0.5*bases["Transformer"][n] for n in range(1, 41)}
     compat_nn_t     = _compat_topk_sum(nn_t,                  k=compat_k)
+    compat_gnn_t    = _compat_topk_sum(bases.get("GNN", {}),  k=compat_k)
     reg_t = _regime_features_at_t(t_idx)
     roll_ent_t = _rolling_entropy_from_history(history, window=30)
     roll_disp_t = _dispersion_last_draw(history)
@@ -6685,12 +7022,14 @@ def _latest_feats_at_t(t_idx, overrides=None):
             bases["HMM"].get(num, 0.0),
             float(bases["LSTM"][num]),
             float(bases["Transformer"][num]),
+            bases.get("GNN", {}).get(num, 0.0),
             markov1_t.get(num, 0.0),
             cooc_t.get(num, 0.0),
             compat_bayes_t[num],
             compat_markov_t[num],
             compat_hmm_t[num],
             compat_nn_t[num],
+            compat_gnn_t[num],
             float(reg_t['weekday']),
             float(reg_t['month']),
             float(reg_t['gap_days']),
