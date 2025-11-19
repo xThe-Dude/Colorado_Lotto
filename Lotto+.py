@@ -342,7 +342,7 @@ if '_per_expert_prob_dicts_at_t' not in globals():
     def _per_expert_prob_dicts_at_t(t_idx):
         """Return base probability dicts at historical index t_idx using only draws[:t_idx].
         Provides a safe, minimal version compatible with older code paths.
-        Keys match _per_expert_names(): ["Bayes","Markov","HMM","LSTM","Transformer"].
+        Keys match _per_expert_names(): ["Bayes","Markov","HMM","LSTM","Transformer","GNN"].
         """
         try:
             t = int(t_idx)
@@ -400,6 +400,17 @@ if '_per_expert_prob_dicts_at_t' not in globals():
         except Exception:
             lstm_t = {n: 1.0/40 for n in range(1,41)}
             trans_t = {n: 1.0/40 for n in range(1,41)}
+        # GNN
+        try:
+            if '_gnn_prob_from_history' in globals():
+                import numpy as _np
+                gnn_model_ref = globals().get("gnn_model", None)
+                meta_gnn = _meta_features_at_idx(t - 1) if t > 0 else _np.array([0.0, 0.5, 0.5])
+                gnn_t = _gnn_prob_from_history(hist, gnn_model=gnn_model_ref, meta_features=meta_gnn)
+            else:
+                gnn_t = {n: 1.0/40 for n in range(1,41)}
+        except Exception:
+            gnn_t = {n: 1.0/40 for n in range(1,41)}
         # Normalise defensively
         def _norm(d):
             import numpy as _np
@@ -412,6 +423,7 @@ if '_per_expert_prob_dicts_at_t' not in globals():
             "HMM": _norm(hmm_t),
             "LSTM": _norm(lstm_t),
             "Transformer": _norm(trans_t),
+            "GNN": _norm(gnn_t),
         }
 
 # 3) Joint/marginal blender used by SetAR decoding paths
@@ -5742,7 +5754,15 @@ def _per_expert_prob_dicts_at_t(t_idx):
         lstmP = _uniform_prob40()
         transP = _uniform_prob40()
 
-    return {"Bayes": bayes, "Markov": markov, "HMM": hmmP, "LSTM": lstmP, "Transformer": transP}
+    # --- GNN at t (using trained gnn_model if available) ---
+    try:
+        gnn_model_ref = globals().get("gnn_model", None)
+        meta_gnn = _meta_features_at_idx(t_idx - 1) if t_idx > 0 else np.array([0.0, 0.5, 0.5])
+        gnnP = _gnn_prob_from_history(hist, gnn_model=gnn_model_ref, meta_features=meta_gnn)
+    except Exception:
+        gnnP = _uniform_prob40()
+
+    return {"Bayes": bayes, "Markov": markov, "HMM": hmmP, "LSTM": lstmP, "Transformer": transP, "GNN": gnnP}
 
 # --- Walk-forward backtest with per-expert deltas + miss explanation ---
 
@@ -6452,7 +6472,7 @@ if '_PostRankIsotonic' not in globals():
 # 2) Expert name ordering used throughout
 if '_per_expert_names' not in globals():
     def _per_expert_names():
-        return ["Bayes", "Markov", "HMM", "LSTM", "Transformer"]
+        return ["Bayes", "Markov", "HMM", "LSTM", "Transformer", "GNN"]
 
 # 3) Historical per‑expert distributions builder used by backtests/diagnostics
 if '_per_expert_prob_dicts_at_t' not in globals():
@@ -6501,6 +6521,17 @@ if '_per_expert_prob_dicts_at_t' not in globals():
         except Exception:
             lstm_t = {n: 1.0/40 for n in range(1,41)}
             trans_t = {n: 1.0/40 for n in range(1,41)}
+        # GNN
+        try:
+            if '_gnn_prob_from_history' in globals():
+                import numpy as _np
+                gnn_model_ref = globals().get("gnn_model", None)
+                meta_gnn = _meta_features_at_idx(t - 1) if t > 0 else _np.array([0.0, 0.5, 0.5])
+                gnn_t = _gnn_prob_from_history(hist, gnn_model=gnn_model_ref, meta_features=meta_gnn)
+            else:
+                gnn_t = {n: 1.0/40 for n in range(1,41)}
+        except Exception:
+            gnn_t = {n: 1.0/40 for n in range(1,41)}
         # Normalise defensively
         def _norm(d):
             import numpy as _np
@@ -6513,6 +6544,7 @@ if '_per_expert_prob_dicts_at_t' not in globals():
             "HMM": _norm(hmm_t),
             "LSTM": _norm(lstm_t),
             "Transformer": _norm(trans_t),
+            "GNN": _norm(gnn_t),
         }
 
 # 4) Joint/marginal blender used by SetAR decoding paths
