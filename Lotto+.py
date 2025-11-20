@@ -7818,6 +7818,113 @@ def _probs_from_pf(hist_draws, num_particles=4000, alpha=0.005, sigma=0.01):
         raw = _uniform_prob40()
     return _rescale_probs_to_six(raw)
 
+def _probs_from_ensemble(hist_draws):
+    """
+    6-expert ensemble: computes Bayes, Markov, HMM, LSTM, Transformer, GNN from hist_draws,
+    learns adaptive weights based on recent performance, and returns the blended distribution.
+    """
+    import numpy as np
+    try:
+        # 1) Compute all 6 base experts from hist_draws only
+        bayes_p = compute_bayes_posterior(hist_draws, alpha=1)
+        bayes_p = {n: bayes_p.get(n, 0.0) for n in range(1, 41)}
+        s = sum(bayes_p.values())
+        if s > 0:
+            bayes_p = {n: bayes_p[n]/s for n in range(1, 41)}
+
+        markov_p = _markov_prob_from_history(hist_draws)
+        hmm_p = _build_hmm_prob_from_subset(hist_draws, n_states=3, n_seeds=4) if HMM_OK else _uniform_prob40()
+
+        # For neural nets (LSTM/Transformer): compute features from the last k draws of hist_draws
+        t_idx = len(hist_draws)
+        if t_idx > k:
+            feats = compute_stat_features(hist_draws[t_idx-k:t_idx], t_idx-1)
+            feats = feats.reshape(1, feats.shape[0], feats.shape[1])
+            try:
+                meta_feats = np.array([_meta_features_at_idx(t_idx)], dtype=float)
+            except Exception:
+                meta_feats = None
+            _l, _t = _predict_with_nets(feats, meta_feats, t_idx=t_idx, use_finetune=True, mc_passes=7)
+            lstm_p = {n: float(_l[n-1]) for n in range(1, 41)}
+            transformer_p = {n: float(_t[n-1]) for n in range(1, 41)}
+        else:
+            lstm_p = _uniform_prob40()
+            transformer_p = _uniform_prob40()
+
+        # GNN
+        try:
+            if t_idx > k:
+                meta_feats = np.array([_meta_features_at_idx(t_idx)], dtype=float)
+            else:
+                meta_feats = None
+            gnn_p = _gnn_prob_from_history(hist_draws, gnn_model=globals().get('gnn_model', None),
+                                          meta_features=meta_feats[0] if meta_feats is not None else None)
+        except Exception:
+            gnn_p = _uniform_prob40()
+
+        # 2) Learn weights from recent NLLs (use last 60 draws of hist_draws for weight learning)
+        # For simplicity, use equal weights if insufficient history, otherwise compute NLL-based weights
+        if len(hist_draws) < 30:
+            w = np.ones(6, dtype=float) / 6.0
+        else:
+            # Compute per-expert NLLs on recent window
+            window_size = min(60, len(hist_draws) // 2)
+            nlls = np.zeros(6, dtype=float)
+            count = 0
+            for i in range(max(10, len(hist_draws) - window_size), len(hist_draws)):
+                sub_hist = hist_draws[:i]
+                truth = hist_draws[i]
+                try:
+                    b_sub = compute_bayes_posterior(sub_hist, alpha=1)
+                    nlls[0] += _nll_from_prob_dict(b_sub, truth)
+                    m_sub = _markov_prob_from_history(sub_hist)
+                    nlls[1] += _nll_from_prob_dict(m_sub, truth)
+                    h_sub = _build_hmm_prob_from_subset(sub_hist) if HMM_OK else _uniform_prob40()
+                    nlls[2] += _nll_from_prob_dict(h_sub, truth)
+                    # Skip LSTM/Transformer/GNN in backtest weight learning (too expensive)
+                    nlls[3] += 20.0  # placeholder
+                    nlls[4] += 20.0
+                    nlls[5] += 20.0
+                    count += 1
+                except Exception:
+                    continue
+            if count > 0:
+                nlls /= float(count)
+                # Softmax(-NLL) for weights
+                x = -nlls
+                x = x - np.max(x)
+                w = np.exp(x)
+                w = w / (w.sum() + 1e-12)
+            else:
+                w = np.ones(6, dtype=float) / 6.0
+
+        # 3) Blend the 6 experts
+        P = {}
+        for n in range(1, 41):
+            bv = np.array([
+                bayes_p.get(n, 0.0),
+                markov_p.get(n, 0.0),
+                hmm_p.get(n, 0.0),
+                lstm_p.get(n, 0.0),
+                transformer_p.get(n, 0.0),
+                gnn_p.get(n, 0.0),
+            ], dtype=float)
+            P[n] = float(np.dot(w, bv))
+
+        # Normalize
+        s = sum(P.values())
+        if s > 0:
+            P = {n: P[n]/s for n in range(1, 41)}
+        else:
+            P = _uniform_prob40()
+
+        return _rescale_probs_to_six(P)
+
+    except Exception as e:
+        import warnings
+        warnings.warn(f"Ensemble computation failed: {e}")
+        return _uniform_prob40()
+
 def _evaluate_method(hist_draws, method_fn, eval_window=80):
     """Walk-forward backtest on the tail of history; return (avg_hits, mean_nll)."""
     N = len(hist_draws)
@@ -7844,6 +7951,7 @@ def _evaluate_method(hist_draws, method_fn, eval_window=80):
 def _choose_best_method(hist_draws, eval_window=80):
     """Return (name, method_fn, metrics_dict) for the best-performing method."""
     cand = [
+        ("Ensemble6", _probs_from_ensemble),
         ("ParticleFilter", _probs_from_pf),
         ("HMM", _probs_from_hmm),
         ("Bayes", _probs_from_bayes),
