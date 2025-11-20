@@ -7458,37 +7458,6 @@ def _compat_topk_sum(prob_dict, k=5):
 
 
 
-def _build_hmm_prob_from_subset(draw_list, n_states=3):
-    """
-    Fit a small HMM on the subset and return per‑number emission means
-    for the last state, normalised. Uses MultiLabelBinarizer (already imported).
-    """
-    if not HMM_OK:
-        return _uniform_prob40()
-    if len(draw_list) < 5:
-        return _uniform_prob40()
-    try:
-        mlb_local = MultiLabelBinarizer(classes=list(range(1, 41)))
-        bin_mat = mlb_local.fit_transform([sorted(list(d)) for d in draw_list])
-        # MultinomialHMM on integer count vectors; shorter training and looser tol to reduce convergence noise
-        hmm_local = hmm.MultinomialHMM(n_components=n_states, n_iter=50, tol=1e-2, random_state=42, verbose=False)
-        with _squelch_streams(r"MultinomialHMM has undergone"):
-            hmm_local.fit(bin_mat.astype(int))
-            # Use helper for compatibility to get posteriors
-            post = _hmm_posteriors(hmm_local, bin_mat.astype(int))
-        last_st = int(np.argmax(post[-1]))
-        emiss = hmm_local.emissionprob_[last_st]
-        emiss = np.clip(emiss, 1e-12, None)
-        probs = {n: float(emiss[n - 1]) for n in range(1, 41)}
-        s = sum(probs.values())
-        if s <= 0:
-            return _uniform_prob40()
-        return {n: probs[n] / s for n in range(1, 41)}
-    except Exception:
-        # Fallback to uniform if HMM fails to converge
-        return _uniform_prob40()
-
-
 # --- Weekday subseries / gate / historical reconstruction --------------------
 
 def _weekday_subseries_prob_until(wd, t_idx):
