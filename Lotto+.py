@@ -4027,8 +4027,13 @@ def _gnn_prob_from_history(hist_draws, gnn_model=None, meta_features=None):
         # Meta features (default if not provided)
         if meta_features is None:
             meta_features = np_.array([[0.0, 0.5, 0.5]], dtype=float)  # (1, 3)
-        elif meta_features.ndim == 1:
-            meta_features = np_.expand_dims(meta_features, axis=0)
+        else:
+            # Convert to numpy array if it's a list
+            if not isinstance(meta_features, np_.ndarray):
+                meta_features = np_.array(meta_features, dtype=float)
+            # Expand dims if 1D
+            if meta_features.ndim == 1:
+                meta_features = np_.expand_dims(meta_features, axis=0)
 
         # Predict
         logits = gnn_model.predict([node_batch, adj_batch, meta_features], verbose=0)
