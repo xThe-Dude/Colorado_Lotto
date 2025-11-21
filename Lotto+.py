@@ -256,7 +256,7 @@ def _fit_expert_calibrators(t_eval):
         try:
             hist = _history_upto(t, context="_fit_expert_calibrators")
             if 'compute_stat_features' in globals():
-                feats_t = compute_stat_features(hist[-min(len(hist), 8):], t - 1)
+                feats_t = compute_stat_features(hist[-min(len(hist), 20):], t - 1)
                 feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
             else:
                 continue
@@ -374,13 +374,13 @@ if '_per_expert_prob_dicts_at_t' not in globals():
         except Exception:
             markov_t = {n: 1.0/40 for n in range(1,41)}
         try:
-            hmm_t = _build_hmm_prob_from_subset(hist)
+            hmm_t = _build_tcn_prob_from_subset(hist)
         except Exception:
             hmm_t = {n: 1.0/40 for n in range(1,41)}
         # LSTM / Transformer via existing net predictor, if available
         try:
             if 'compute_stat_features' in globals():
-                feats_t = compute_stat_features(hist[-min(len(hist), 8):], t - 1)
+                feats_t = compute_stat_features(hist[-min(len(hist), 20):], t - 1)
                 feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
             else:
                 feats_t = None
@@ -1145,7 +1145,7 @@ class _MetaStacker:
                 self.feature_dim_ = int(X.shape[1]) if (X.ndim == 2) else 5
                 return self
             clf = MLPClassifier(
-                hidden_layer_sizes=(16,),
+                hidden_layer_sizes=(128, 64, 32,),
                 activation="relu",
                 alpha=1e-4,
                 learning_rate_init=1e-3,
@@ -1795,11 +1795,14 @@ def train_ticket_ranker(t_start, t_end, neg_per_draw=10000, min_draws=20):
         if hasattr(xgb, "XGBRanker"):
             model = xgb.XGBRanker(
                 objective="rank:pairwise",
-                n_estimators=400,
-                max_depth=5,
-                learning_rate=0.05,
+                n_estimators=500,
+                max_depth=8,
+                learning_rate=0.03,
                 subsample=0.8,
                 colsample_bytree=0.8,
+                min_child_weight=3,
+                gamma=0.1,
+                reg_alpha=0.1,
                 reg_lambda=1.0,
                 random_state=42,
                 n_jobs=0
@@ -1813,10 +1816,13 @@ def train_ticket_ranker(t_start, t_end, neg_per_draw=10000, min_draws=20):
             model = xgb.XGBClassifier(
                 objective="binary:logistic",
                 n_estimators=500,
-                max_depth=5,
-                learning_rate=0.05,
+                max_depth=8,
+                learning_rate=0.03,
                 subsample=0.8,
                 colsample_bytree=0.8,
+                min_child_weight=3,
+                gamma=0.1,
+                reg_alpha=0.1,
                 reg_lambda=1.0,
                 random_state=42,
                 n_jobs=0,
@@ -2811,6 +2817,160 @@ for i in range(1, 41):
 # --- Hidden Markov Model (HMM) using hmmlearn (multi-seed average with sanity fallback) ---
 from hmmlearn import hmm
 
+def _build_tcn_prob_from_subset(sub_draws, n_filters=32, kernel_size=3, lookback=64):
+    """
+    Temporal Convolutional Network (TCN) for Lotto+ - replaces HMM.
+
+    Uses dilated causal convolutions to capture long-range temporal dependencies
+    in lottery draw patterns with a much larger receptive field than HMM.
+
+    Architecture:
+      • Multi-scale dilated convolutions: [1, 2, 4, 8, 16, 32] (receptive field: 127 time steps)
+      • Residual connections for gradient flow
+      • Batch normalization for stable training
+      • Dropout for regularization
+      • Global pooling + dense layer for final predictions
+
+    Args:
+        sub_draws: List of historical draws (each draw is a set/list of 6 numbers from 1-40)
+        n_filters: Number of convolutional filters per layer (default: 32)
+        kernel_size: Kernel size for convolutions (default: 3)
+        lookback: Maximum sequence length to use (default: 64 draws)
+
+    Returns:
+        dict {1..40 -> p} where p is a categorical distribution (sum=1)
+    """
+    import numpy as _np
+    from sklearn.preprocessing import MultiLabelBinarizer
+
+    # Build 0/1 matrix X: shape (T, 40) where X[t, n-1] = 1 if number n appeared in draw t
+    try:
+        mlb_local = MultiLabelBinarizer(classes=list(range(1, 41)))
+        X = mlb_local.fit_transform([sorted(list(d)) for d in sub_draws]).astype(float)
+    except Exception:
+        return {n: 1.0/40 for n in range(1, 41)}
+
+    # Need reasonable history to fit TCN (at least 20 draws, preferably more)
+    if X.shape[0] < 20:
+        return {n: 1.0/40 for n in range(1, 41)}
+
+    # Use only the most recent 'lookback' draws to avoid excessive computation
+    if X.shape[0] > lookback:
+        X = X[-lookback:]
+
+    # TCN requires TensorFlow/Keras - fallback to simpler model if unavailable
+    try:
+        import tensorflow as tf
+        from tensorflow import keras
+        from tensorflow.keras import layers
+
+        # Suppress TF warnings for cleaner output
+        import os
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        tf.get_logger().setLevel('ERROR')
+
+        # Reshape for Conv1D: (batch=1, time_steps=T, features=40)
+        X_tcn = _np.expand_dims(X, axis=0)
+
+        # Build TCN model with dilated causal convolutions
+        inputs = keras.Input(shape=(X.shape[0], 40))
+        x = inputs
+
+        # Dilated convolutional layers with increasing dilation rates
+        dilation_rates = [1, 2, 4, 8, 16, 32]
+        for i, dilation in enumerate(dilation_rates):
+            # Causal dilated conv
+            conv = layers.Conv1D(
+                filters=n_filters,
+                kernel_size=kernel_size,
+                dilation_rate=dilation,
+                padding='causal',
+                activation='relu',
+                name=f'tcn_conv_{i}'
+            )(x)
+            conv = layers.BatchNormalization()(conv)
+            conv = layers.Dropout(0.2)(conv, training=True)  # MC dropout for uncertainty
+
+            # Residual connection (with projection if needed)
+            if x.shape[-1] != n_filters:
+                x = layers.Conv1D(n_filters, 1, padding='same')(x)
+            x = layers.Add()([x, conv])
+
+        # Global pooling to aggregate temporal information
+        x = layers.GlobalAveragePooling1D()(x)
+
+        # Dense layers for final prediction
+        x = layers.Dense(64, activation='relu')(x)
+        x = layers.Dropout(0.3)(x, training=True)
+        outputs = layers.Dense(40, activation='softmax')(x)
+
+        model = keras.Model(inputs=inputs, outputs=outputs)
+
+        # Compile with categorical crossentropy (no training, just forward pass for now)
+        # For a lightweight approach, use the model with random weights as a regularized prior
+        # In a full implementation, you'd train on historical data
+
+        # Quick training on the sequence (self-supervised: predict next from history)
+        # Create training pairs: input = draws[:-1], target = draws[-1]
+        if X.shape[0] >= 10:
+            # Simple training: predict last draw from previous draws
+            X_train = X[:-1]
+            y_train = X[-1:]  # Last draw as target
+
+            # Need multiple samples for training - use sliding windows
+            window_size = min(20, X.shape[0] - 1)
+            X_windows = []
+            y_windows = []
+            for i in range(X.shape[0] - window_size):
+                X_windows.append(X[i:i+window_size])
+                y_windows.append(X[i+window_size])
+
+            if len(X_windows) >= 5:
+                X_train = _np.array(X_windows)
+                y_train = _np.array(y_windows)
+
+                # Compile and train
+                model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=0.001),
+                    loss='binary_crossentropy'  # Multi-label binary classification
+                )
+
+                # Quick training (low epochs to avoid overfitting on small data)
+                model.fit(
+                    X_train, y_train,
+                    epochs=20,
+                    batch_size=max(1, len(X_train) // 4),
+                    verbose=0,
+                    shuffle=True
+                )
+
+        # Predict on the full sequence
+        pred = model.predict(X_tcn, verbose=0)[0]  # Shape: (40,)
+
+        # Enforce sum-to-6 semantics then convert to categorical (sum=1)
+        pred_6 = _enforce_sum6(pred * 6.0)
+        pred_1 = pred_6 / 6.0
+        pred_1 = _np.clip(pred_1, 1e-12, None)
+        pred_1 = pred_1 / (pred_1.sum() + 1e-12)
+
+        return {n: float(pred_1[n-1]) for n in range(1, 41)}
+
+    except Exception as e:
+        # Fallback: if TCN fails, use a simple time-weighted average
+        try:
+            # Exponentially weighted moving average (recent draws matter more)
+            decay = 0.95
+            weights = _np.array([decay ** i for i in range(X.shape[0]-1, -1, -1)])
+            weights = weights / weights.sum()
+
+            weighted_freq = _np.dot(weights, X)  # Shape: (40,)
+            weighted_freq = _np.clip(weighted_freq, 1e-12, None)
+            weighted_freq = weighted_freq / (weighted_freq.sum() + 1e-12)
+
+            return {n: float(weighted_freq[n-1]) for n in range(1, 41)}
+        except Exception:
+            return {n: 1.0/40 for n in range(1, 41)}
+
 def _build_hmm_prob_from_subset(sub_draws, n_states=3, n_seeds=8):
     """
     Factorized‑emissions HMM for Lotto+.
@@ -2939,9 +3099,9 @@ def _build_hmm_prob_from_subset(sub_draws, n_states=3, n_seeds=8):
     # --- Final fallback: uniform
     return {n: 1.0/40 for n in range(1, 41)}
 
-# Robust, version-tolerant live HMM probability
+# Robust, version-tolerant live TCN probability (replaces HMM)
 try:
-    hmm_prob = _build_hmm_prob_from_subset(draws, n_states=3, n_seeds=8) if HMM_OK else _uniform_prob40()
+    hmm_prob = _build_tcn_prob_from_subset(draws) if HMM_OK else _uniform_prob40()
 except Exception:
     hmm_prob = _uniform_prob40()
 
@@ -3483,6 +3643,98 @@ def compute_stat_features(draw_window, idx_offset):
             ci_idx = ci_raw if ci_raw < MAX_COMM_FEATS else (MAX_COMM_FEATS - 1)
         comm_onehot = [1.0 if k == ci_idx else 0.0 for k in range(MAX_COMM_FEATS)]
 
+        # ========== PHASE 1: CROSS-NUMBER INTERACTION FEATURES ==========
+        # These capture relationships between numbers beyond individual statistics
+
+        # 1. Consecutive run features (is this number part of a consecutive sequence?)
+        cand_num = i + 1
+        consecutive_before = 0
+        consecutive_after = 0
+        if last_in_window:
+            if (cand_num - 1) in last_in_window:
+                consecutive_before = 1
+            if (cand_num + 1) in last_in_window:
+                consecutive_after = 1
+        consecutive_total = consecutive_before + consecutive_after
+
+        # 2. Arithmetic sequence indicator (part of equally-spaced sequence)
+        # Check if cand_num forms arithmetic progression with 2+ numbers in last draw
+        in_arithmetic_seq = 0
+        if last_in_window and len(last_in_window) >= 2:
+            for j in range(len(last_in_window)):
+                for k in range(j+1, len(last_in_window)):
+                    a, b = last_in_window[j], last_in_window[k]
+                    diff = b - a
+                    # Check if cand_num forms arithmetic seq with (a,b)
+                    if cand_num == a - diff or cand_num == b + diff:
+                        in_arithmetic_seq = 1
+                        break
+                if in_arithmetic_seq:
+                    break
+
+        # 3. Momentum feature (trending up or down in recent draws)
+        # Compare frequency in last 5 draws vs previous 5 draws
+        momentum = 0.0
+        if idx_offset >= 10:
+            recent_5 = draws[max(0, idx_offset-4):idx_offset+1]
+            prev_5 = draws[max(0, idx_offset-9):max(0, idx_offset-4)]
+            freq_recent = sum(1 for d in recent_5 if cand_num in d) / max(1, len(recent_5))
+            freq_prev = sum(1 for d in prev_5 if cand_num in d) / max(1, len(prev_5))
+            momentum = freq_recent - freq_prev  # Range: [-1, 1]
+
+        # 4. Co-occurrence score with last draw (sum of pairwise co-occurrence rates)
+        cooc_score = 0.0
+        if last_in_window:
+            for other_num in last_in_window:
+                pair = tuple(sorted([cand_num, other_num]))
+                if pair in pair_counter:
+                    cooc_score += pair_counter[pair] / max(1, len(draws[:idx_offset+1]))
+        cooc_score_norm = min(1.0, cooc_score)  # Normalize to [0, 1]
+
+        # 5. Exclusion pattern (inverse co-occurrence - numbers that rarely appear together)
+        exclusion_score = 0.0
+        if last_in_window:
+            for other_num in last_in_window:
+                pair = tuple(sorted([cand_num, other_num]))
+                expected_cooc = (freq_counter_window.get(cand_num, 1) * freq_counter_window.get(other_num, 1)) / max(1, len(draw_window)**2)
+                actual_cooc = pair_counter.get(pair, 0) / max(1, len(draws[:idx_offset+1]))
+                if expected_cooc > actual_cooc:
+                    exclusion_score += (expected_cooc - actual_cooc)
+        exclusion_score_norm = min(1.0, exclusion_score)
+
+        # 6. Quadrant distribution features (pressure from each quarter of the number space)
+        # Count how many numbers from each quadrant in last 3 draws
+        last_3_draws = draw_window[-min(3, len(draw_window)):] if draw_window else []
+        q1_pressure = sum(1 for d in last_3_draws for n in d if 1 <= n <= 10) / max(1, len(last_3_draws) * 6)
+        q2_pressure = sum(1 for d in last_3_draws for n in d if 11 <= n <= 20) / max(1, len(last_3_draws) * 6)
+        q3_pressure = sum(1 for d in last_3_draws for n in d if 21 <= n <= 30) / max(1, len(last_3_draws) * 6)
+        q4_pressure = sum(1 for d in last_3_draws for n in d if 31 <= n <= 40) / max(1, len(last_3_draws) * 6)
+
+        # Which quadrant is candidate number in?
+        cand_quadrant = min(3, (cand_num - 1) // 10)  # 0, 1, 2, or 3
+        cand_quadrant_pressure = [q1_pressure, q2_pressure, q3_pressure, q4_pressure][cand_quadrant]
+
+        # 7. Cycle detection (does number appear in regular intervals?)
+        cycle_strength = 0.0
+        if idx_offset >= 20:
+            appearances = [t for t in range(max(0, idx_offset-19), idx_offset+1) if cand_num in draws[t]]
+            if len(appearances) >= 3:
+                gaps_between = [appearances[j+1] - appearances[j] for j in range(len(appearances)-1)]
+                if gaps_between:
+                    gap_std = float(np.std(gaps_between))
+                    # Low std means regular cycle, high std means irregular
+                    cycle_strength = max(0.0, 1.0 - gap_std/10.0)  # Normalize
+
+        # 8. Sum compatibility (does cand_num help reach typical sum ranges?)
+        # Typical winning sums are around 120-140 (6 numbers averaging 20-23)
+        if last_in_window and len(last_in_window) >= 3:
+            partial_sum = sum(last_in_window[:3])  # Sum of first 3 numbers from last draw
+            expected_remaining = 3 * 20  # Expected average for remaining 3 numbers
+            deviation_if_added = abs((partial_sum + cand_num + expected_remaining) - 120) / 120.0
+            sum_compatibility = max(0.0, 1.0 - deviation_if_added)
+        else:
+            sum_compatibility = 0.5
+
         feats += [
             nearest_dist_norm[i],      # distance to nearest num in last draw (norm)
             contain_gap_norm[i],       # size of containing gap (norm)
@@ -3490,7 +3742,17 @@ def compute_stat_features(draw_window, idx_offset):
             sum_last_norm, odd_last_norm, even_last_norm,  # last-draw sum/parity
             low_frac_recent, high_frac_recent,            # bucket pressure (recent)
             cand_parity, cand_low,                        # candidate parity/bucket
-            cluster_size_norm, cluster_overlap_ratio      # co-occurrence cluster features
+            cluster_size_norm, cluster_overlap_ratio,     # co-occurrence cluster features
+            # NEW CROSS-NUMBER INTERACTION FEATURES:
+            consecutive_before, consecutive_after, consecutive_total,  # Consecutive runs
+            in_arithmetic_seq,                            # Arithmetic sequence membership
+            momentum,                                     # Trend direction (up/down)
+            cooc_score_norm,                             # Co-occurrence with last draw
+            exclusion_score_norm,                        # Exclusion pattern strength
+            q1_pressure, q2_pressure, q3_pressure, q4_pressure,  # Quadrant pressures
+            cand_quadrant_pressure,                      # Candidate's quadrant pressure
+            cycle_strength,                              # Regular cycle indicator
+            sum_compatibility                            # Sum range compatibility
         ] + comm_onehot
         features.append(feats)
     return np.array(features)  # shape (40, n_features)
@@ -4258,8 +4520,9 @@ def _train_ticket_reranker_quick(hist_draws, max_hist=120, neg_per=6):
         if len(X) < 50:
             return None
         model = xgb.XGBRegressor(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.0, reg_lambda=1.0,
+            n_estimators=500, max_depth=8, learning_rate=0.03,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
+            gamma=0.1, reg_alpha=0.1, reg_lambda=1.0,
             n_jobs=1, verbosity=0
         )
         import numpy as _np
@@ -5633,7 +5896,7 @@ def _fit_expert_calibrators(t_eval):
         try:
             hist = draws[:t]
             if 'compute_stat_features' in globals():
-                feats_t = compute_stat_features(hist[-min(len(hist), 8):], t - 1)
+                feats_t = compute_stat_features(hist[-min(len(hist), 20):], t - 1)
                 feats_t = feats_t.reshape(1, feats_t.shape[0], feats_t.shape[1])
             else:
                 continue
@@ -5738,7 +6001,7 @@ def _per_expert_prob_dicts_at_t(t_idx):
 
     # --- HMM (guarded by version gate) ---
     try:
-        hmmP = _build_hmm_prob_from_subset(hist, n_states=3, n_seeds=4) if HMM_OK else _uniform_prob40()
+        hmmP = _build_tcn_prob_from_subset(hist) if HMM_OK else _uniform_prob40()
     except Exception:
         hmmP = _uniform_prob40()
 
@@ -6509,7 +6772,7 @@ if '_per_expert_prob_dicts_at_t' not in globals():
         except Exception:
             markov_t = {n: 1.0/40 for n in range(1,41)}
         try:
-            hmm_t = _build_hmm_prob_from_subset(hist)
+            hmm_t = _build_tcn_prob_from_subset(hist)
         except Exception:
             hmm_t = {n: 1.0/40 for n in range(1,41)}
         # LSTM / Transformer via existing net predictor, if available
@@ -6887,7 +7150,7 @@ def _per_expert_prob_dicts_at_t(t_idx):
     # Base sources (strictly pre-t_idx)
     bayes_t   = _norm_prob_dict_local(compute_bayes_posterior(history, alpha=1))
     markov_t  = _markov_prob_from_history(history)
-    hmm_t     = _build_hmm_prob_from_subset(history)
+    hmm_t     = _build_tcn_prob_from_subset(history)
 
     # Neural nets features at time t_idx
     feats_t = compute_stat_features(draws[t_idx - k: t_idx], t_idx - 1)
@@ -7476,7 +7739,7 @@ def _weekday_subseries_prob_until(wd, t_idx):
         sub_draws = [draws[i] for i in idxs]
         bayes_t = _norm_prob_dict_local(compute_bayes_posterior(sub_draws, alpha=1))
         markov_t = _markov_prob_from_history(sub_draws)
-        hmm_t   = _build_hmm_prob_from_subset(sub_draws)
+        hmm_t   = _build_tcn_prob_from_subset(sub_draws)
         # simple equal-weight blend
         out = {n: (bayes_t.get(n,0.0) + markov_t.get(n,0.0) + hmm_t.get(n,0.0)) / 3.0 for n in range(1,41)}
         return _norm_prob_dict_local(out)
@@ -7543,7 +7806,7 @@ def _main_ensemble_prob_at_t(t_idx):
     # Base sources
     bayes_t   = _norm_prob_dict_local(compute_bayes_posterior(history, alpha=1))
     markov_t  = _markov_prob_from_history(history)
-    hmm_t     = _build_hmm_prob_from_subset(history)
+    hmm_t     = _build_tcn_prob_from_subset(history)
     markov1_t = _markov1_prob_from_history(history)
 
     # Neural nets at time t: features from last k draws ending at t_idx-1
@@ -7768,7 +8031,7 @@ def _probs_from_hmm(hist_draws):
     """Emission mixture from an HMM fit on `hist_draws` (or uniform if HMM not OK)."""
     try:
         if HMM_OK:
-            raw = _build_hmm_prob_from_subset(hist_draws, n_states=3, n_seeds=4)
+            raw = _build_tcn_prob_from_subset(hist_draws)
         else:
             raw = _uniform_prob40()
     except Exception:
@@ -7806,7 +8069,7 @@ def _probs_from_ensemble(hist_draws):
             bayes_p = {n: bayes_p[n]/s for n in range(1, 41)}
 
         markov_p = _markov_prob_from_history(hist_draws)
-        hmm_p = _build_hmm_prob_from_subset(hist_draws, n_states=3, n_seeds=4) if HMM_OK else _uniform_prob40()
+        hmm_p = _build_tcn_prob_from_subset(hist_draws) if HMM_OK else _uniform_prob40()
 
         # For neural nets (LSTM/Transformer): compute features from the last k draws of hist_draws
         t_idx = len(hist_draws)
@@ -7852,7 +8115,7 @@ def _probs_from_ensemble(hist_draws):
                     nlls[0] += _nll_from_prob_dict(b_sub, truth)
                     m_sub = _markov_prob_from_history(sub_hist)
                     nlls[1] += _nll_from_prob_dict(m_sub, truth)
-                    h_sub = _build_hmm_prob_from_subset(sub_hist) if HMM_OK else _uniform_prob40()
+                    h_sub = _build_tcn_prob_from_subset(sub_hist) if HMM_OK else _uniform_prob40()
                     nlls[2] += _nll_from_prob_dict(h_sub, truth)
                     # Skip LSTM/Transformer/GNN in backtest weight learning (too expensive)
                     nlls[3] += 20.0  # placeholder
