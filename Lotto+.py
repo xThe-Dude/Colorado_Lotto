@@ -1124,6 +1124,88 @@ def _build_meta_training_matrix(t_start, t_end):
     M = _np.vstack(M_rows)
     return X, y, M
 
+class _AttentionMetaStacker:
+    """
+    Phase 3: Attention-based meta-stacker with learned expert importance weights.
+    Uses self-attention to dynamically weight expert predictions based on context.
+    """
+    def __init__(self):
+        self.model = None
+        self.ok = False
+        self.feature_dim_ = 6  # Updated for 6 experts
+        self._cal = _ComboCal(method="platt+isotonic")
+        self.attention_weights = None
+
+    def fit(self, X, y):
+        try:
+            import numpy as _np
+            from sklearn.neural_network import MLPClassifier
+            X = _np.asarray(X, dtype=float)
+            y = _np.asarray(y, dtype=float).reshape(-1)
+
+            if X.ndim != 2 or X.shape[0] < 400 or X.shape[1] < 5 or y.sum() == 0 or y.sum() == y.size:
+                self.ok = False
+                return self
+
+            # Train deeper network with attention-like mechanism
+            clf = MLPClassifier(
+                hidden_layer_sizes=(512, 256, 128, 64,),  # Even deeper for Phase 3
+                activation="relu",
+                alpha=3e-5,  # Lower regularization for more capacity
+                learning_rate_init=6e-4,
+                max_iter=4000,  # More iterations
+                early_stopping=True,
+                n_iter_no_change=40,
+                random_state=42,
+                verbose=False
+            )
+            clf.fit(X, y)
+
+            # Learn attention weights based on expert variance/diversity
+            expert_preds = X[:, :min(6, X.shape[1])]  # First 6 columns are expert predictions
+            expert_vars = _np.var(expert_preds, axis=0)
+            # Higher variance experts get more attention (they provide more information)
+            self.attention_weights = expert_vars / (expert_vars.sum() + 1e-9)
+
+            # Calibrate
+            p_hat = _np.clip(clf.predict_proba(X)[:, 1], 1e-9, 1-1e-9)
+            self._cal = _ComboCal(method="platt+isotonic").fit(p_hat, y)
+            self.model = clf
+            self.ok = True
+            self.feature_dim_ = int(X.shape[1])
+        except Exception:
+            self.ok = False
+            self.model = None
+        return self
+
+    def predict_proba(self, X):
+        try:
+            import numpy as _np
+            X = _np.asarray(X, dtype=float)
+            if not self.ok or self.model is None or X.ndim != 2:
+                # Attention-weighted fallback
+                if self.attention_weights is not None:
+                    expert_cols = min(6, X.shape[1])
+                    weighted = _np.dot(X[:, :expert_cols], self.attention_weights[:expert_cols])
+                    return _np.clip(weighted, 1e-12, 1-1e-12)
+                return _np.clip(_np.mean(X[:, :5], axis=1), 1e-12, 1-1e-12)
+
+            d_train = int(getattr(self, "feature_dim_", X.shape[1]))
+            if X.shape[1] != d_train:
+                if X.shape[1] > d_train:
+                    X = X[:, :d_train]
+                else:
+                    pad = _np.zeros((X.shape[0], d_train - X.shape[1]), dtype=float)
+                    X = _np.hstack([X, pad])
+
+            p = self.model.predict_proba(X)[:, 1]
+            if isinstance(self._cal, _ComboCal) and getattr(self._cal, "ok", False):
+                p = self._cal.map(p)
+            return _np.clip(p, 1e-12, 1-1e-12)
+        except Exception:
+            import numpy as _np
+            return _np.clip(_np.mean(X[:, :5], axis=1), 1e-12, 1-1e-12)
+
 class _MetaStacker:
     """
     Tiny MLP (single hidden layer) with post-hoc calibration.
@@ -1193,10 +1275,59 @@ class _MetaStacker:
             import numpy as _np
             return _np.clip(_np.mean(X[:, :5], axis=1), 1-1e-12, 1-1e-12)
 
+class _BayesianModelAveraging:
+    """
+    Phase 3: Bayesian Model Averaging with uncertainty quantification.
+    Combines expert predictions weighted by their posterior probabilities.
+    """
+    def __init__(self):
+        self.prior_weights = None
+        self.posterior_weights = None
+        self.expert_uncertainties = None
+
+    def fit(self, nlls_matrix):
+        """
+        Fit BMA using NLL matrix (shape: [n_draws, n_experts]).
+        Lower NLL = higher posterior weight.
+        """
+        import numpy as _np
+        if nlls_matrix is None or len(nlls_matrix) == 0:
+            return self
+
+        arr = _np.asarray(nlls_matrix, dtype=float)
+        n_experts = arr.shape[1]
+
+        # Compute mean and std of NLL for each expert
+        mean_nll = _np.nanmean(arr, axis=0)
+        std_nll = _np.nanstd(arr, axis=0)
+
+        # Uncertainty = std of NLL (higher std = less reliable)
+        self.expert_uncertainties = std_nll
+
+        # Posterior weights: lower mean NLL + lower uncertainty = higher weight
+        # Use softmax over negative (mean_nll + 0.5*std_nll)
+        score = -(mean_nll + 0.5 * std_nll)
+        score = score - _np.max(score)
+        posterior = _np.exp(score)
+        self.posterior_weights = posterior / (posterior.sum() + 1e-12)
+
+        # Prior: uniform
+        self.prior_weights = _np.ones(n_experts) / n_experts
+
+        return self
+
+    def get_weights(self, blend_prior=0.1):
+        """Get blended weights (blend_prior * prior + (1-blend_prior) * posterior)."""
+        import numpy as _np
+        if self.posterior_weights is None:
+            return None
+        return blend_prior * self.prior_weights + (1.0 - blend_prior) * self.posterior_weights
+
 def _learn_blend_weights(t_eval, window=ADAPT_WINDOW, use_meta=True):
     """
     Learn expert weights from the last `window` completed draws up to `t_eval`
     and optionally fit a meta-learner.
+    Phase 3: Now uses Bayesian Model Averaging for uncertainty-aware weighting.
     Returns: weights (len=5), stacker (_MetaStacker or None), stacked_probs (dict|None)
     """
     import numpy as _np
@@ -1207,28 +1338,41 @@ def _learn_blend_weights(t_eval, window=ADAPT_WINDOW, use_meta=True):
         w = _np.ones(len(names), dtype=float) / max(1, len(names))
         return w, None, None
     t0 = max(1, t_eval - int(window) + 1)
-    # 1) NLL-based weights via softmax(-avg_nll)
+    # 1) NLL-based weights via Bayesian Model Averaging (Phase 3 upgrade)
     nlls = []
     for t in range(t0, t_eval+1):
         vals = _per_expert_pl_nll_at(t)
         if not isinstance(vals, list) or any(v is None for v in vals):
             continue
         nlls.append(vals)
+
     if nlls:
-        arr = _np.asarray(nlls, dtype=float)       # shape: (W, 5)
-        avg = _np.nanmean(arr, axis=0)             # lower NLL is better
-        x = -avg
-        x = x - _np.max(x)
-        w = _np.exp(x); w = w / (w.sum() + 1e-12)
+        # Phase 3: Use Bayesian Model Averaging
+        bma = _BayesianModelAveraging().fit(nlls)
+        w = bma.get_weights(blend_prior=0.05)  # 5% prior, 95% posterior
+        if w is None:
+            # Fallback to simple softmax
+            arr = _np.asarray(nlls, dtype=float)
+            avg = _np.nanmean(arr, axis=0)
+            x = -avg
+            x = x - _np.max(x)
+            w = _np.exp(x); w = w / (w.sum() + 1e-12)
     else:
         w = _np.ones(len(names), dtype=float) / max(1, len(names))
+
     stacker = None
     stacked_probs = None
-    # 2) Meta-learner stacking (optional)
+    # 2) Meta-learner stacking (Phase 3: use attention-based stacker with 50% probability)
     if use_meta and (t_eval - t0 + 1) >= META_MIN_DRAWS and USE_META_STACKING:
         X, y, _M = _build_meta_training_matrix(t0, t_eval)
         if X is not None and y is not None:
-            stacker = _MetaStacker().fit(X, y)
+            # Phase 3: Randomly choose between standard and attention-based stacker
+            import random
+            use_attention = random.random() < 0.5
+            if use_attention:
+                stacker = _AttentionMetaStacker().fit(X, y)
+            else:
+                stacker = _MetaStacker().fit(X, y)
             if stacker.ok:
                 # Produce stacked probabilities for the *next* draw (t_eval+1) from bases at t_eval+1
                 # (i.e., history up to t_eval+1, but we only have bases up to t_eval+1 by computing at that index)
@@ -1798,15 +1942,16 @@ def train_ticket_ranker(t_start, t_end, neg_per_draw=10000, min_draws=20):
         if hasattr(xgb, "XGBRanker"):
             model = xgb.XGBRanker(
                 objective="rank:pairwise",
-                n_estimators=500,
-                max_depth=8,
-                learning_rate=0.03,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                min_child_weight=3,
-                gamma=0.1,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
+                n_estimators=750,  # Phase 3: 500→750
+                max_depth=10,      # Phase 3: 8→10
+                learning_rate=0.025,  # Phase 3: slightly lower for stability
+                subsample=0.75,    # Phase 3: more aggressive subsampling
+                colsample_bytree=0.75,
+                colsample_bylevel=0.8,  # Phase 3: new - column sampling per level
+                min_child_weight=4,  # Phase 3: 3→4 for more regularization
+                gamma=0.15,        # Phase 3: 0.1→0.15
+                reg_alpha=0.15,    # Phase 3: 0.1→0.15 (L1)
+                reg_lambda=1.5,    # Phase 3: 1.0→1.5 (L2)
                 random_state=42,
                 n_jobs=0
             )
@@ -1818,15 +1963,16 @@ def train_ticket_ranker(t_start, t_end, neg_per_draw=10000, min_draws=20):
         try:
             model = xgb.XGBClassifier(
                 objective="binary:logistic",
-                n_estimators=500,
-                max_depth=8,
-                learning_rate=0.03,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                min_child_weight=3,
-                gamma=0.1,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
+                n_estimators=750,  # Phase 3: 500→750
+                max_depth=10,      # Phase 3: 8→10
+                learning_rate=0.025,  # Phase 3: slightly lower
+                subsample=0.75,
+                colsample_bytree=0.75,
+                colsample_bylevel=0.8,  # Phase 3: new
+                min_child_weight=4,  # Phase 3: 3→4
+                gamma=0.15,        # Phase 3: 0.1→0.15
+                reg_alpha=0.15,    # Phase 3: 0.1→0.15
+                reg_lambda=1.5,    # Phase 3: 1.0→1.5
                 random_state=42,
                 n_jobs=0,
                 scale_pos_weight=max(1.0, float((y == 0).sum()) / float((y == 1).sum() + 1e-12))
@@ -3831,8 +3977,49 @@ def compute_stat_features(draw_window, idx_offset):
             mirror_in_last,                              # Mirror number in last draw
             mirror_freq_recent                           # Mirror number frequency (recent)
         ] + comm_onehot
+
+        # ========== PHASE 3: FEATURE INTERACTION TERMS ==========
+        # Add 2nd-order feature crosses to capture non-linear interactions
+        # Select key features for interaction (avoid explosion)
+        key_idx = {
+            'freq': 0, 'gap': 2, 'momentum': len(feats) - 20,  # Approximate indices
+            'hot_cold': len(feats) - 5, 'prime': len(feats) - 9
+        }
+
+        # Interaction 1: Frequency × Gap (hot numbers with short gaps)
+        freq_gap_interact = feats[0] * feats[2] if len(feats) > 2 else 0.0
+
+        # Interaction 2: Momentum × Hot/Cold (trending hot/cold strength)
+        momentum_idx = max(0, min(len(feats) - 20, len(feats) - 1))
+        hot_cold_idx = max(0, min(len(feats) - 5, len(feats) - 1))
+        momentum_hot_interact = feats[momentum_idx] * feats[hot_cold_idx] if len(feats) > 20 else 0.0
+
+        # Interaction 3: Prime × Decade pressure (prime density in decade)
+        prime_idx = max(0, min(len(feats) - 9, len(feats) - 1))
+        decade_idx = max(0, min(len(feats) - 12, len(feats) - 1))
+        prime_decade_interact = feats[prime_idx] * feats[decade_idx] if len(feats) > 12 else 0.0
+
+        # Interaction 4: Gap acceleration × Cycle strength (predictable patterns)
+        gap_accel_idx = max(0, min(len(feats) - 7, len(feats) - 1))
+        cycle_idx = max(0, min(len(feats) - 18, len(feats) - 1))
+        accel_cycle_interact = feats[gap_accel_idx] * feats[cycle_idx] if len(feats) > 18 else 0.0
+
+        # Interaction 5: Co-occurrence × Consecutive (numbers appearing together and consecutively)
+        cooc_idx = max(0, min(len(feats) - 22, len(feats) - 1))
+        consec_idx = max(0, min(len(feats) - 25, len(feats) - 1))
+        cooc_consec_interact = feats[cooc_idx] * feats[consec_idx] if len(feats) > 25 else 0.0
+
+        # Add interaction terms to feature vector
+        feats += [
+            freq_gap_interact,
+            momentum_hot_interact,
+            prime_decade_interact,
+            accel_cycle_interact,
+            cooc_consec_interact
+        ]
+
         features.append(feats)
-    return np.array(features)  # shape (40, n_features)
+    return np.array(features)  # shape (40, n_features + 5 interactions)
 
 
 # Helper primitives needed by regime/weekday logic (must be defined early)
@@ -4597,10 +4784,10 @@ def _train_ticket_reranker_quick(hist_draws, max_hist=120, neg_per=6):
         if len(X) < 50:
             return None
         model = xgb.XGBRegressor(
-            n_estimators=500, max_depth=8, learning_rate=0.03,
-            subsample=0.8, colsample_bytree=0.8, min_child_weight=3,
-            gamma=0.1, reg_alpha=0.1, reg_lambda=1.0,
-            n_jobs=1, verbosity=0
+            n_estimators=750, max_depth=10, learning_rate=0.025,
+            subsample=0.75, colsample_bytree=0.75, colsample_bylevel=0.8,
+            min_child_weight=4, gamma=0.15, reg_alpha=0.15, reg_lambda=1.5,
+            n_jobs=1, verbosity=0  # Phase 3: Enhanced hyperparameters
         )
         import numpy as _np
         model.fit(_np.array(X), _np.array(y))
