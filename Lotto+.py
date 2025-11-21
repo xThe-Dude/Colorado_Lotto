@@ -6414,11 +6414,11 @@ def _emit_predictions(bayesP, markovP, hmmP, lstmP, transP, path="predicted_tick
     ranked = sorted([(n, float(P.get(n, 0.0))) for n in range(1, 41)], key=lambda x: x[1], reverse=True)
     top6 = [n for n, _ in ranked[:6]]
 
-    # Write plaintext prediction file
+    # Write plaintext prediction file (intermediate - will be overwritten by final backtest-selected prediction)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(" ".join(str(n) for n in sorted(top6)) + "\n")
-        print("[PREDICT] Top6:", sorted(top6), "-> written to", path)
+        print("[PREDICT] Intermediate ensemble Top6:", sorted(top6), "-> written to", path)
     except Exception as e:
         warnings.warn(f"Failed to write predictions to {path}: {e}")
 
@@ -7979,6 +7979,7 @@ def _predict_and_write_single_ticket(holdout_last=False, eval_window=80):
         best_name = f"{best_name}+BayesFallback"
     ticket = _top6_from_prob_dict(P)
     _write_single_ticket(ticket, path="predicted_tickets.txt")
+    print(f"[FINAL] Prediction written to predicted_tickets.txt: {ticket}")
     # Logging for traceability
     try:
         _log_predict_run(blend_weights=[best_name], t_eval=(len(draws)-1))
