@@ -1,5 +1,5 @@
 [TRAIN] keras.Model.fit patched: epochs≥500, EarlyStopping(patience=25), ReduceLROnPlateau(patience=7), cosine=true
-[ENV] {"type": "env", "ts": "2025-11-20T17:48:28+00:00", "python": "3.13.7", "platform": {"system": "Darwin", "release": "25.1.0", "machine": "arm64"}, "versions": {"numpy": "2.3.5", "pandas": "2.3.3", "scikit_learn": "1.7.2", "scipy": "1.16.3", "tensorflow": "2.20.0", "keras": "3.12.0", "xgboost": "3.1.1", "hmmlearn": "0.3.3"}}
+[ENV] {"type": "env", "ts": "2025-11-20T21:10:31+00:00", "python": "3.13.7", "platform": {"system": "Darwin", "release": "25.1.0", "machine": "arm64"}, "versions": {"numpy": "2.3.5", "pandas": "2.3.3", "scikit_learn": "1.7.2", "scipy": "1.16.3", "tensorflow": "2.20.0", "keras": "3.12.0", "xgboost": "3.1.1", "hmmlearn": "0.3.3"}}
 Loaded 748 historical draws.
 [REGIME] GMM fitted on 748 draws into 3 regimes.
 [REGIME] Current regime: 2
@@ -275,203 +275,343 @@ Epoch 1/500
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
-Chosen method: PF, Final Top-6 prediction: [8, 11, 19, 35, 37, 40]
+Chosen method: PF, Final Top-6 prediction: [5, 8, 10, 19, 35, 38]
 Training Temporal CNN model...
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 Epoch 1/500
-74/74 - 2s - 25ms/step - hits_at_6: 0.9025 - loss: 0.8072 - recall_at_6: 0.1504 - val_hits_at_6: 0.9605 - val_loss: 0.5247 - val_recall_at_6: 0.1601
+74/74 - 2s - 25ms/step - hits_at_6: 0.9182 - loss: 1.4606 - recall_at_6: 0.1530 - val_hits_at_6: 0.9342 - val_loss: 0.8800 - val_recall_at_6: 0.1557
 Epoch 2/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8709 - loss: 0.5644 - recall_at_6: 0.1451 - val_hits_at_6: 0.9276 - val_loss: 0.5230 - val_recall_at_6: 0.1546
+74/74 - 0s - 2ms/step - hits_at_6: 0.9196 - loss: 0.8525 - recall_at_6: 0.1533 - val_hits_at_6: 0.8816 - val_loss: 0.5483 - val_recall_at_6: 0.1469
 Epoch 3/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9735 - loss: 0.5497 - recall_at_6: 0.1622 - val_hits_at_6: 0.8816 - val_loss: 0.5152 - val_recall_at_6: 0.1469
+74/74 - 0s - 2ms/step - hits_at_6: 0.8827 - loss: 0.7001 - recall_at_6: 0.1471 - val_hits_at_6: 1.0132 - val_loss: 0.5294 - val_recall_at_6: 0.1689
 Epoch 4/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9315 - loss: 0.5442 - recall_at_6: 0.1552 - val_hits_at_6: 0.8947 - val_loss: 0.5150 - val_recall_at_6: 0.1491
+74/74 - 0s - 2ms/step - hits_at_6: 0.8514 - loss: 0.5914 - recall_at_6: 0.1419 - val_hits_at_6: 1.0658 - val_loss: 0.5267 - val_recall_at_6: 0.1776
 Epoch 5/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9049 - loss: 0.5370 - recall_at_6: 0.1508 - val_hits_at_6: 0.9342 - val_loss: 0.5138 - val_recall_at_6: 0.1557
+74/74 - 0s - 2ms/step - hits_at_6: 0.9235 - loss: 0.5772 - recall_at_6: 0.1539 - val_hits_at_6: 0.9539 - val_loss: 0.5235 - val_recall_at_6: 0.1590
 Epoch 6/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9766 - loss: 0.5329 - recall_at_6: 0.1628 - val_hits_at_6: 0.9671 - val_loss: 0.5162 - val_recall_at_6: 0.1612
+74/74 - 0s - 2ms/step - hits_at_6: 0.9097 - loss: 0.5686 - recall_at_6: 0.1516 - val_hits_at_6: 0.9539 - val_loss: 0.5249 - val_recall_at_6: 0.1590
 Epoch 7/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9783 - loss: 0.5276 - recall_at_6: 0.1630 - val_hits_at_6: 0.9934 - val_loss: 0.5145 - val_recall_at_6: 0.1656
+74/74 - 0s - 2ms/step - hits_at_6: 0.9054 - loss: 0.5618 - recall_at_6: 0.1509 - val_hits_at_6: 0.9408 - val_loss: 0.5234 - val_recall_at_6: 0.1568
 Epoch 8/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.0046 - loss: 0.5235 - recall_at_6: 0.1674 - val_hits_at_6: 0.9079 - val_loss: 0.5144 - val_recall_at_6: 0.1513
+74/74 - 0s - 2ms/step - hits_at_6: 0.9269 - loss: 0.5619 - recall_at_6: 0.1545 - val_hits_at_6: 0.8816 - val_loss: 0.5230 - val_recall_at_6: 0.1469
 Epoch 9/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9679 - loss: 0.5206 - recall_at_6: 0.1613 - val_hits_at_6: 1.0461 - val_loss: 0.5115 - val_recall_at_6: 0.1743
+74/74 - 0s - 2ms/step - hits_at_6: 0.9534 - loss: 0.5563 - recall_at_6: 0.1589 - val_hits_at_6: 0.9145 - val_loss: 0.5225 - val_recall_at_6: 0.1524
 Epoch 10/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9841 - loss: 0.5184 - recall_at_6: 0.1640 - val_hits_at_6: 1.0921 - val_loss: 0.5113 - val_recall_at_6: 0.1820
+74/74 - 0s - 2ms/step - hits_at_6: 0.9341 - loss: 0.5550 - recall_at_6: 0.1557 - val_hits_at_6: 0.9013 - val_loss: 0.5213 - val_recall_at_6: 0.1502
 Epoch 11/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.0746 - loss: 0.5150 - recall_at_6: 0.1791 - val_hits_at_6: 1.0329 - val_loss: 0.5106 - val_recall_at_6: 0.1721
+74/74 - 0s - 2ms/step - hits_at_6: 0.9614 - loss: 0.5551 - recall_at_6: 0.1602 - val_hits_at_6: 0.9342 - val_loss: 0.5213 - val_recall_at_6: 0.1557
 Epoch 12/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.0232 - loss: 0.5131 - recall_at_6: 0.1705 - val_hits_at_6: 1.1250 - val_loss: 0.5089 - val_recall_at_6: 0.1875
+74/74 - 0s - 2ms/step - hits_at_6: 1.0034 - loss: 0.5530 - recall_at_6: 0.1672 - val_hits_at_6: 0.8355 - val_loss: 0.5227 - val_recall_at_6: 0.1393
 Epoch 13/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1086 - loss: 0.5108 - recall_at_6: 0.1848 - val_hits_at_6: 1.0855 - val_loss: 0.5077 - val_recall_at_6: 0.1809
+74/74 - 0s - 2ms/step - hits_at_6: 0.9768 - loss: 0.5509 - recall_at_6: 0.1628 - val_hits_at_6: 0.9605 - val_loss: 0.5210 - val_recall_at_6: 0.1601
 Epoch 14/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.0898 - loss: 0.5092 - recall_at_6: 0.1816 - val_hits_at_6: 1.1382 - val_loss: 0.5075 - val_recall_at_6: 0.1897
+74/74 - 0s - 2ms/step - hits_at_6: 0.9771 - loss: 0.5484 - recall_at_6: 0.1628 - val_hits_at_6: 0.9211 - val_loss: 0.5217 - val_recall_at_6: 0.1535
 Epoch 15/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.0960 - loss: 0.5088 - recall_at_6: 0.1827 - val_hits_at_6: 1.0789 - val_loss: 0.5072 - val_recall_at_6: 0.1798
+74/74 - 0s - 2ms/step - hits_at_6: 1.0140 - loss: 0.5499 - recall_at_6: 0.1690 - val_hits_at_6: 0.9211 - val_loss: 0.5219 - val_recall_at_6: 0.1535
 Epoch 16/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1583 - loss: 0.5071 - recall_at_6: 0.1931 - val_hits_at_6: 0.9934 - val_loss: 0.5068 - val_recall_at_6: 0.1656
+74/74 - 0s - 2ms/step - hits_at_6: 1.0299 - loss: 0.5475 - recall_at_6: 0.1717 - val_hits_at_6: 0.9013 - val_loss: 0.5215 - val_recall_at_6: 0.1502
 Epoch 17/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2000 - loss: 0.5062 - recall_at_6: 0.2000 - val_hits_at_6: 1.0263 - val_loss: 0.5060 - val_recall_at_6: 0.1711
+74/74 - 0s - 2ms/step - hits_at_6: 1.0234 - loss: 0.5436 - recall_at_6: 0.1706 - val_hits_at_6: 0.9408 - val_loss: 0.5212 - val_recall_at_6: 0.1568
 Epoch 18/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1559 - loss: 0.5061 - recall_at_6: 0.1926 - val_hits_at_6: 1.0329 - val_loss: 0.5057 - val_recall_at_6: 0.1721
+74/74 - 0s - 2ms/step - hits_at_6: 1.0152 - loss: 0.5439 - recall_at_6: 0.1692 - val_hits_at_6: 0.9342 - val_loss: 0.5215 - val_recall_at_6: 0.1557
 Epoch 19/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2529 - loss: 0.5052 - recall_at_6: 0.2088 - val_hits_at_6: 1.0526 - val_loss: 0.5055 - val_recall_at_6: 0.1754
+74/74 - 0s - 2ms/step - hits_at_6: 1.0615 - loss: 0.5415 - recall_at_6: 0.1769 - val_hits_at_6: 0.9671 - val_loss: 0.5197 - val_recall_at_6: 0.1612
 Epoch 20/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1858 - loss: 0.5049 - recall_at_6: 0.1976 - val_hits_at_6: 1.0921 - val_loss: 0.5054 - val_recall_at_6: 0.1820
+74/74 - 0s - 2ms/step - hits_at_6: 1.0644 - loss: 0.5396 - recall_at_6: 0.1774 - val_hits_at_6: 0.9934 - val_loss: 0.5209 - val_recall_at_6: 0.1656
 Epoch 21/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2411 - loss: 0.5048 - recall_at_6: 0.2068 - val_hits_at_6: 0.9934 - val_loss: 0.5053 - val_recall_at_6: 0.1656
+74/74 - 0s - 2ms/step - hits_at_6: 1.0323 - loss: 0.5402 - recall_at_6: 0.1721 - val_hits_at_6: 0.9342 - val_loss: 0.5197 - val_recall_at_6: 0.1557
 Epoch 22/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1839 - loss: 0.5046 - recall_at_6: 0.1973 - val_hits_at_6: 0.9934 - val_loss: 0.5052 - val_recall_at_6: 0.1656
+74/74 - 0s - 2ms/step - hits_at_6: 1.0557 - loss: 0.5394 - recall_at_6: 0.1760 - val_hits_at_6: 0.9868 - val_loss: 0.5206 - val_recall_at_6: 0.1645
 Epoch 23/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1812 - loss: 0.5046 - recall_at_6: 0.1969 - val_hits_at_6: 1.0263 - val_loss: 0.5051 - val_recall_at_6: 0.1711
+74/74 - 0s - 2ms/step - hits_at_6: 1.0603 - loss: 0.5399 - recall_at_6: 0.1767 - val_hits_at_6: 0.9671 - val_loss: 0.5199 - val_recall_at_6: 0.1612
 Epoch 24/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2806 - loss: 0.5041 - recall_at_6: 0.2134 - val_hits_at_6: 1.0526 - val_loss: 0.5050 - val_recall_at_6: 0.1754
+74/74 - 0s - 2ms/step - hits_at_6: 1.0787 - loss: 0.5388 - recall_at_6: 0.1798 - val_hits_at_6: 0.9605 - val_loss: 0.5200 - val_recall_at_6: 0.1601
 Epoch 25/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2592 - loss: 0.5041 - recall_at_6: 0.2099 - val_hits_at_6: 1.0263 - val_loss: 0.5050 - val_recall_at_6: 0.1711
+74/74 - 0s - 2ms/step - hits_at_6: 1.0748 - loss: 0.5378 - recall_at_6: 0.1791 - val_hits_at_6: 0.9539 - val_loss: 0.5199 - val_recall_at_6: 0.1590
 Epoch 26/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2814 - loss: 0.5042 - recall_at_6: 0.2136 - val_hits_at_6: 1.0395 - val_loss: 0.5050 - val_recall_at_6: 0.1732
+74/74 - 0s - 2ms/step - hits_at_6: 1.0560 - loss: 0.5371 - recall_at_6: 0.1760 - val_hits_at_6: 0.9605 - val_loss: 0.5198 - val_recall_at_6: 0.1601
 Epoch 27/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2420 - loss: 0.5043 - recall_at_6: 0.2070 - val_hits_at_6: 1.0395 - val_loss: 0.5050 - val_recall_at_6: 0.1732
+74/74 - 0s - 2ms/step - hits_at_6: 1.0345 - loss: 0.5396 - recall_at_6: 0.1724 - val_hits_at_6: 0.9671 - val_loss: 0.5198 - val_recall_at_6: 0.1612
 Epoch 28/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1431 - loss: 0.5043 - recall_at_6: 0.1905 - val_hits_at_6: 0.9737 - val_loss: 0.5040 - val_recall_at_6: 0.1623
+74/74 - 0s - 2ms/step - hits_at_6: 1.0427 - loss: 0.5392 - recall_at_6: 0.1738 - val_hits_at_6: 0.8947 - val_loss: 0.5198 - val_recall_at_6: 0.1491
 Epoch 29/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1388 - loss: 0.5031 - recall_at_6: 0.1898 - val_hits_at_6: 1.0526 - val_loss: 0.5033 - val_recall_at_6: 0.1754
+74/74 - 0s - 2ms/step - hits_at_6: 1.0164 - loss: 0.5378 - recall_at_6: 0.1694 - val_hits_at_6: 0.8684 - val_loss: 0.5185 - val_recall_at_6: 0.1447
 Epoch 30/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2039 - loss: 0.5024 - recall_at_6: 0.2007 - val_hits_at_6: 1.0329 - val_loss: 0.5029 - val_recall_at_6: 0.1721
+74/74 - 0s - 2ms/step - hits_at_6: 1.0625 - loss: 0.5371 - recall_at_6: 0.1771 - val_hits_at_6: 0.9605 - val_loss: 0.5173 - val_recall_at_6: 0.1601
 Epoch 31/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1730 - loss: 0.5024 - recall_at_6: 0.1955 - val_hits_at_6: 1.0132 - val_loss: 0.5029 - val_recall_at_6: 0.1689
+74/74 - 0s - 2ms/step - hits_at_6: 1.0316 - loss: 0.5361 - recall_at_6: 0.1719 - val_hits_at_6: 0.9539 - val_loss: 0.5210 - val_recall_at_6: 0.1590
 Epoch 32/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2326 - loss: 0.5020 - recall_at_6: 0.2054 - val_hits_at_6: 0.9803 - val_loss: 0.5030 - val_recall_at_6: 0.1634
+74/74 - 0s - 2ms/step - hits_at_6: 1.0051 - loss: 0.5333 - recall_at_6: 0.1675 - val_hits_at_6: 0.8816 - val_loss: 0.5204 - val_recall_at_6: 0.1469
 Epoch 33/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.1986 - loss: 0.5021 - recall_at_6: 0.1998 - val_hits_at_6: 0.9539 - val_loss: 0.5031 - val_recall_at_6: 0.1590
+74/74 - 0s - 2ms/step - hits_at_6: 1.0794 - loss: 0.5323 - recall_at_6: 0.1799 - val_hits_at_6: 0.8882 - val_loss: 0.5200 - val_recall_at_6: 0.1480
 Epoch 34/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2519 - loss: 0.5018 - recall_at_6: 0.2087 - val_hits_at_6: 1.0329 - val_loss: 0.5029 - val_recall_at_6: 0.1721
+74/74 - 0s - 2ms/step - hits_at_6: 1.0825 - loss: 0.5310 - recall_at_6: 0.1804 - val_hits_at_6: 0.9539 - val_loss: 0.5194 - val_recall_at_6: 0.1590
 Epoch 35/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2739 - loss: 0.5016 - recall_at_6: 0.2123 - val_hits_at_6: 1.0329 - val_loss: 0.5028 - val_recall_at_6: 0.1721
+74/74 - 0s - 2ms/step - hits_at_6: 1.1001 - loss: 0.5303 - recall_at_6: 0.1834 - val_hits_at_6: 1.0066 - val_loss: 0.5170 - val_recall_at_6: 0.1678
 Epoch 36/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2189 - loss: 0.5015 - recall_at_6: 0.2031 - val_hits_at_6: 1.0197 - val_loss: 0.5027 - val_recall_at_6: 0.1700
+74/74 - 0s - 2ms/step - hits_at_6: 1.0232 - loss: 0.5309 - recall_at_6: 0.1705 - val_hits_at_6: 0.9671 - val_loss: 0.5185 - val_recall_at_6: 0.1612
 Epoch 37/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2647 - loss: 0.5013 - recall_at_6: 0.2108 - val_hits_at_6: 1.0000 - val_loss: 0.5027 - val_recall_at_6: 0.1667
+74/74 - 0s - 2ms/step - hits_at_6: 1.0789 - loss: 0.5288 - recall_at_6: 0.1798 - val_hits_at_6: 0.9605 - val_loss: 0.5205 - val_recall_at_6: 0.1601
 Epoch 38/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2763 - loss: 0.5015 - recall_at_6: 0.2127 - val_hits_at_6: 1.0066 - val_loss: 0.5028 - val_recall_at_6: 0.1678
+74/74 - 0s - 2ms/step - hits_at_6: 1.1670 - loss: 0.5270 - recall_at_6: 0.1945 - val_hits_at_6: 0.9211 - val_loss: 0.5188 - val_recall_at_6: 0.1535
 Epoch 39/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3547 - loss: 0.5012 - recall_at_6: 0.2258 - val_hits_at_6: 0.9934 - val_loss: 0.5032 - val_recall_at_6: 0.1656
+74/74 - 0s - 2ms/step - hits_at_6: 1.1385 - loss: 0.5254 - recall_at_6: 0.1898 - val_hits_at_6: 0.9145 - val_loss: 0.5186 - val_recall_at_6: 0.1524
 Epoch 40/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2816 - loss: 0.5010 - recall_at_6: 0.2136 - val_hits_at_6: 1.0658 - val_loss: 0.5029 - val_recall_at_6: 0.1776
+74/74 - 0s - 2ms/step - hits_at_6: 1.2370 - loss: 0.5231 - recall_at_6: 0.2062 - val_hits_at_6: 1.0132 - val_loss: 0.5159 - val_recall_at_6: 0.1689
 Epoch 41/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2891 - loss: 0.5010 - recall_at_6: 0.2148 - val_hits_at_6: 0.9474 - val_loss: 0.5027 - val_recall_at_6: 0.1579
+74/74 - 0s - 2ms/step - hits_at_6: 1.1677 - loss: 0.5221 - recall_at_6: 0.1946 - val_hits_at_6: 0.8947 - val_loss: 0.5170 - val_recall_at_6: 0.1491
 Epoch 42/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2855 - loss: 0.5010 - recall_at_6: 0.2142 - val_hits_at_6: 1.0263 - val_loss: 0.5031 - val_recall_at_6: 0.1711
+74/74 - 0s - 2ms/step - hits_at_6: 1.2143 - loss: 0.5199 - recall_at_6: 0.2024 - val_hits_at_6: 0.9408 - val_loss: 0.5168 - val_recall_at_6: 0.1568
 Epoch 43/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.2601 - loss: 0.5010 - recall_at_6: 0.2100 - val_hits_at_6: 0.9474 - val_loss: 0.5030 - val_recall_at_6: 0.1579
+74/74 - 0s - 2ms/step - hits_at_6: 1.1976 - loss: 0.5194 - recall_at_6: 0.1996 - val_hits_at_6: 0.9474 - val_loss: 0.5155 - val_recall_at_6: 0.1579
 Epoch 44/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3308 - loss: 0.5004 - recall_at_6: 0.2218 - val_hits_at_6: 0.9342 - val_loss: 0.5032 - val_recall_at_6: 0.1557
+74/74 - 0s - 2ms/step - hits_at_6: 1.1916 - loss: 0.5198 - recall_at_6: 0.1986 - val_hits_at_6: 0.9276 - val_loss: 0.5160 - val_recall_at_6: 0.1546
 Epoch 45/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3535 - loss: 0.5005 - recall_at_6: 0.2256 - val_hits_at_6: 0.9803 - val_loss: 0.5035 - val_recall_at_6: 0.1634
+74/74 - 0s - 2ms/step - hits_at_6: 1.2483 - loss: 0.5173 - recall_at_6: 0.2081 - val_hits_at_6: 0.9539 - val_loss: 0.5156 - val_recall_at_6: 0.1590
 Epoch 46/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3767 - loss: 0.5003 - recall_at_6: 0.2294 - val_hits_at_6: 0.9539 - val_loss: 0.5039 - val_recall_at_6: 0.1590
+74/74 - 0s - 2ms/step - hits_at_6: 1.2949 - loss: 0.5159 - recall_at_6: 0.2158 - val_hits_at_6: 0.9605 - val_loss: 0.5160 - val_recall_at_6: 0.1601
 Epoch 47/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3446 - loss: 0.4999 - recall_at_6: 0.2241 - val_hits_at_6: 0.9474 - val_loss: 0.5032 - val_recall_at_6: 0.1579
+74/74 - 0s - 2ms/step - hits_at_6: 1.2879 - loss: 0.5155 - recall_at_6: 0.2146 - val_hits_at_6: 0.9211 - val_loss: 0.5157 - val_recall_at_6: 0.1535
 Epoch 48/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3492 - loss: 0.4998 - recall_at_6: 0.2249 - val_hits_at_6: 0.9671 - val_loss: 0.5035 - val_recall_at_6: 0.1612
+74/74 - 0s - 2ms/step - hits_at_6: 1.2449 - loss: 0.5149 - recall_at_6: 0.2075 - val_hits_at_6: 0.9868 - val_loss: 0.5146 - val_recall_at_6: 0.1645
 Epoch 49/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.4008 - loss: 0.4994 - recall_at_6: 0.2335 - val_hits_at_6: 1.0526 - val_loss: 0.5040 - val_recall_at_6: 0.1754
+74/74 - 0s - 2ms/step - hits_at_6: 1.2471 - loss: 0.5143 - recall_at_6: 0.2079 - val_hits_at_6: 0.9803 - val_loss: 0.5147 - val_recall_at_6: 0.1634
 Epoch 50/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3680 - loss: 0.4993 - recall_at_6: 0.2280 - val_hits_at_6: 0.9605 - val_loss: 0.5031 - val_recall_at_6: 0.1601
+74/74 - 0s - 2ms/step - hits_at_6: 1.3330 - loss: 0.5140 - recall_at_6: 0.2222 - val_hits_at_6: 0.9474 - val_loss: 0.5144 - val_recall_at_6: 0.1579
 Epoch 51/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3880 - loss: 0.4991 - recall_at_6: 0.2313 - val_hits_at_6: 1.0000 - val_loss: 0.5039 - val_recall_at_6: 0.1667
+74/74 - 0s - 2ms/step - hits_at_6: 1.3581 - loss: 0.5130 - recall_at_6: 0.2264 - val_hits_at_6: 0.9737 - val_loss: 0.5144 - val_recall_at_6: 0.1623
 Epoch 52/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3955 - loss: 0.4990 - recall_at_6: 0.2326 - val_hits_at_6: 0.9737 - val_loss: 0.5037 - val_recall_at_6: 0.1623
+74/74 - 0s - 2ms/step - hits_at_6: 1.3275 - loss: 0.5116 - recall_at_6: 0.2212 - val_hits_at_6: 0.9934 - val_loss: 0.5143 - val_recall_at_6: 0.1656
 Epoch 53/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.3711 - loss: 0.4988 - recall_at_6: 0.2285 - val_hits_at_6: 0.9671 - val_loss: 0.5036 - val_recall_at_6: 0.1612
+74/74 - 0s - 2ms/step - hits_at_6: 1.3629 - loss: 0.5110 - recall_at_6: 0.2272 - val_hits_at_6: 0.9737 - val_loss: 0.5132 - val_recall_at_6: 0.1623
 Epoch 54/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.4023 - loss: 0.4987 - recall_at_6: 0.2337 - val_hits_at_6: 0.9934 - val_loss: 0.5036 - val_recall_at_6: 0.1656
+74/74 - 0s - 2ms/step - hits_at_6: 1.3506 - loss: 0.5101 - recall_at_6: 0.2251 - val_hits_at_6: 0.9474 - val_loss: 0.5139 - val_recall_at_6: 0.1579
 Epoch 55/500
-74/74 - 0s - 2ms/step - hits_at_6: 1.4124 - loss: 0.4984 - recall_at_6: 0.2354 - val_hits_at_6: 0.9276 - val_loss: 0.5032 - val_recall_at_6: 0.1546
+74/74 - 0s - 2ms/step - hits_at_6: 1.4194 - loss: 0.5092 - recall_at_6: 0.2366 - val_hits_at_6: 0.9934 - val_loss: 0.5133 - val_recall_at_6: 0.1656
+Epoch 56/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4317 - loss: 0.5087 - recall_at_6: 0.2386 - val_hits_at_6: 1.0066 - val_loss: 0.5128 - val_recall_at_6: 0.1678
+Epoch 57/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.3460 - loss: 0.5095 - recall_at_6: 0.2243 - val_hits_at_6: 0.9737 - val_loss: 0.5126 - val_recall_at_6: 0.1623
+Epoch 58/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4382 - loss: 0.5080 - recall_at_6: 0.2397 - val_hits_at_6: 1.0197 - val_loss: 0.5125 - val_recall_at_6: 0.1700
+Epoch 59/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4418 - loss: 0.5075 - recall_at_6: 0.2403 - val_hits_at_6: 1.0000 - val_loss: 0.5125 - val_recall_at_6: 0.1667
+Epoch 60/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4052 - loss: 0.5080 - recall_at_6: 0.2342 - val_hits_at_6: 1.0395 - val_loss: 0.5126 - val_recall_at_6: 0.1732
+Epoch 61/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4428 - loss: 0.5062 - recall_at_6: 0.2405 - val_hits_at_6: 0.9276 - val_loss: 0.5126 - val_recall_at_6: 0.1546
+Epoch 62/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4776 - loss: 0.5056 - recall_at_6: 0.2463 - val_hits_at_6: 1.0000 - val_loss: 0.5120 - val_recall_at_6: 0.1667
+Epoch 63/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4431 - loss: 0.5062 - recall_at_6: 0.2405 - val_hits_at_6: 1.0000 - val_loss: 0.5122 - val_recall_at_6: 0.1667
+Epoch 64/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4906 - loss: 0.5054 - recall_at_6: 0.2484 - val_hits_at_6: 1.0000 - val_loss: 0.5120 - val_recall_at_6: 0.1667
+Epoch 65/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.3900 - loss: 0.5068 - recall_at_6: 0.2317 - val_hits_at_6: 0.9803 - val_loss: 0.5121 - val_recall_at_6: 0.1634
+Epoch 66/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5048 - loss: 0.5047 - recall_at_6: 0.2508 - val_hits_at_6: 0.9868 - val_loss: 0.5119 - val_recall_at_6: 0.1645
+Epoch 67/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4517 - loss: 0.5048 - recall_at_6: 0.2420 - val_hits_at_6: 0.9868 - val_loss: 0.5117 - val_recall_at_6: 0.1645
+Epoch 68/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5208 - loss: 0.5043 - recall_at_6: 0.2535 - val_hits_at_6: 1.0000 - val_loss: 0.5118 - val_recall_at_6: 0.1667
+Epoch 69/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4370 - loss: 0.5052 - recall_at_6: 0.2395 - val_hits_at_6: 0.9539 - val_loss: 0.5118 - val_recall_at_6: 0.1590
+Epoch 70/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4778 - loss: 0.5049 - recall_at_6: 0.2463 - val_hits_at_6: 1.0066 - val_loss: 0.5115 - val_recall_at_6: 0.1678
+Epoch 71/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5068 - loss: 0.5037 - recall_at_6: 0.2511 - val_hits_at_6: 1.0197 - val_loss: 0.5116 - val_recall_at_6: 0.1700
+Epoch 72/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5022 - loss: 0.5041 - recall_at_6: 0.2504 - val_hits_at_6: 0.9868 - val_loss: 0.5115 - val_recall_at_6: 0.1645
+Epoch 73/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5606 - loss: 0.5033 - recall_at_6: 0.2601 - val_hits_at_6: 1.0132 - val_loss: 0.5116 - val_recall_at_6: 0.1689
+Epoch 74/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5111 - loss: 0.5039 - recall_at_6: 0.2519 - val_hits_at_6: 1.0132 - val_loss: 0.5115 - val_recall_at_6: 0.1689
+Epoch 75/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4785 - loss: 0.5037 - recall_at_6: 0.2464 - val_hits_at_6: 0.9868 - val_loss: 0.5116 - val_recall_at_6: 0.1645
+Epoch 76/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5104 - loss: 0.5035 - recall_at_6: 0.2517 - val_hits_at_6: 0.9803 - val_loss: 0.5116 - val_recall_at_6: 0.1634
+Epoch 77/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5285 - loss: 0.5033 - recall_at_6: 0.2547 - val_hits_at_6: 1.0066 - val_loss: 0.5116 - val_recall_at_6: 0.1678
+Epoch 78/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5157 - loss: 0.5039 - recall_at_6: 0.2526 - val_hits_at_6: 1.0000 - val_loss: 0.5116 - val_recall_at_6: 0.1667
+Epoch 79/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5685 - loss: 0.5023 - recall_at_6: 0.2614 - val_hits_at_6: 0.9934 - val_loss: 0.5116 - val_recall_at_6: 0.1656
+Epoch 80/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5002 - loss: 0.5042 - recall_at_6: 0.2500 - val_hits_at_6: 1.0000 - val_loss: 0.5116 - val_recall_at_6: 0.1667
+Epoch 81/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5145 - loss: 0.5039 - recall_at_6: 0.2524 - val_hits_at_6: 1.0000 - val_loss: 0.5116 - val_recall_at_6: 0.1667
+Epoch 82/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4737 - loss: 0.5038 - recall_at_6: 0.2456 - val_hits_at_6: 1.0526 - val_loss: 0.5117 - val_recall_at_6: 0.1754
+Epoch 83/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4529 - loss: 0.5046 - recall_at_6: 0.2422 - val_hits_at_6: 0.9474 - val_loss: 0.5109 - val_recall_at_6: 0.1579
+Epoch 84/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4802 - loss: 0.5037 - recall_at_6: 0.2467 - val_hits_at_6: 0.9868 - val_loss: 0.5104 - val_recall_at_6: 0.1645
+Epoch 85/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.4368 - loss: 0.5035 - recall_at_6: 0.2395 - val_hits_at_6: 1.0066 - val_loss: 0.5103 - val_recall_at_6: 0.1678
+Epoch 86/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5514 - loss: 0.5017 - recall_at_6: 0.2586 - val_hits_at_6: 0.9605 - val_loss: 0.5100 - val_recall_at_6: 0.1601
+Epoch 87/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5391 - loss: 0.5010 - recall_at_6: 0.2565 - val_hits_at_6: 1.0724 - val_loss: 0.5095 - val_recall_at_6: 0.1787
+Epoch 88/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5449 - loss: 0.5021 - recall_at_6: 0.2575 - val_hits_at_6: 1.0066 - val_loss: 0.5094 - val_recall_at_6: 0.1678
+Epoch 89/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6018 - loss: 0.5003 - recall_at_6: 0.2670 - val_hits_at_6: 1.0658 - val_loss: 0.5098 - val_recall_at_6: 0.1776
+Epoch 90/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5656 - loss: 0.5006 - recall_at_6: 0.2609 - val_hits_at_6: 1.0329 - val_loss: 0.5101 - val_recall_at_6: 0.1721
+Epoch 91/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5347 - loss: 0.4999 - recall_at_6: 0.2558 - val_hits_at_6: 0.9934 - val_loss: 0.5091 - val_recall_at_6: 0.1656
+Epoch 92/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5753 - loss: 0.4992 - recall_at_6: 0.2625 - val_hits_at_6: 1.0263 - val_loss: 0.5093 - val_recall_at_6: 0.1711
+Epoch 93/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5828 - loss: 0.4996 - recall_at_6: 0.2638 - val_hits_at_6: 1.0724 - val_loss: 0.5085 - val_recall_at_6: 0.1787
+Epoch 94/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5642 - loss: 0.4994 - recall_at_6: 0.2607 - val_hits_at_6: 1.0197 - val_loss: 0.5092 - val_recall_at_6: 0.1700
+Epoch 95/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6045 - loss: 0.4986 - recall_at_6: 0.2674 - val_hits_at_6: 1.0132 - val_loss: 0.5096 - val_recall_at_6: 0.1689
+Epoch 96/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.5941 - loss: 0.4984 - recall_at_6: 0.2657 - val_hits_at_6: 1.0329 - val_loss: 0.5091 - val_recall_at_6: 0.1721
+Epoch 97/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6325 - loss: 0.4979 - recall_at_6: 0.2721 - val_hits_at_6: 1.0197 - val_loss: 0.5091 - val_recall_at_6: 0.1700
+Epoch 98/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6482 - loss: 0.4980 - recall_at_6: 0.2747 - val_hits_at_6: 1.0263 - val_loss: 0.5082 - val_recall_at_6: 0.1711
+Epoch 99/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6262 - loss: 0.4974 - recall_at_6: 0.2710 - val_hits_at_6: 1.0197 - val_loss: 0.5088 - val_recall_at_6: 0.1700
+Epoch 100/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6248 - loss: 0.4967 - recall_at_6: 0.2708 - val_hits_at_6: 1.0132 - val_loss: 0.5094 - val_recall_at_6: 0.1689
+Epoch 101/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7070 - loss: 0.4963 - recall_at_6: 0.2845 - val_hits_at_6: 0.9868 - val_loss: 0.5107 - val_recall_at_6: 0.1645
+Epoch 102/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6226 - loss: 0.4968 - recall_at_6: 0.2704 - val_hits_at_6: 1.0132 - val_loss: 0.5103 - val_recall_at_6: 0.1689
+Epoch 103/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6267 - loss: 0.4963 - recall_at_6: 0.2711 - val_hits_at_6: 1.0263 - val_loss: 0.5087 - val_recall_at_6: 0.1711
+Epoch 104/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6851 - loss: 0.4953 - recall_at_6: 0.2808 - val_hits_at_6: 1.0921 - val_loss: 0.5085 - val_recall_at_6: 0.1820
+Epoch 105/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6689 - loss: 0.4955 - recall_at_6: 0.2782 - val_hits_at_6: 0.9803 - val_loss: 0.5079 - val_recall_at_6: 0.1634
+Epoch 106/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7017 - loss: 0.4955 - recall_at_6: 0.2836 - val_hits_at_6: 0.9803 - val_loss: 0.5087 - val_recall_at_6: 0.1634
+Epoch 107/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7276 - loss: 0.4946 - recall_at_6: 0.2879 - val_hits_at_6: 1.0132 - val_loss: 0.5090 - val_recall_at_6: 0.1689
+Epoch 108/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7172 - loss: 0.4944 - recall_at_6: 0.2862 - val_hits_at_6: 1.0461 - val_loss: 0.5094 - val_recall_at_6: 0.1743
+Epoch 109/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7179 - loss: 0.4947 - recall_at_6: 0.2863 - val_hits_at_6: 1.0329 - val_loss: 0.5107 - val_recall_at_6: 0.1721
+Epoch 110/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.6926 - loss: 0.4945 - recall_at_6: 0.2821 - val_hits_at_6: 1.0395 - val_loss: 0.5098 - val_recall_at_6: 0.1732
+Epoch 111/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7073 - loss: 0.4936 - recall_at_6: 0.2845 - val_hits_at_6: 1.0526 - val_loss: 0.5110 - val_recall_at_6: 0.1754
+Epoch 112/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7367 - loss: 0.4930 - recall_at_6: 0.2895 - val_hits_at_6: 1.0395 - val_loss: 0.5115 - val_recall_at_6: 0.1732
+Epoch 113/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7341 - loss: 0.4939 - recall_at_6: 0.2890 - val_hits_at_6: 1.0395 - val_loss: 0.5110 - val_recall_at_6: 0.1732
+Epoch 114/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7292 - loss: 0.4927 - recall_at_6: 0.2882 - val_hits_at_6: 1.0066 - val_loss: 0.5111 - val_recall_at_6: 0.1678
+Epoch 115/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7239 - loss: 0.4928 - recall_at_6: 0.2873 - val_hits_at_6: 1.0461 - val_loss: 0.5104 - val_recall_at_6: 0.1743
+Epoch 116/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7372 - loss: 0.4922 - recall_at_6: 0.2895 - val_hits_at_6: 1.0658 - val_loss: 0.5108 - val_recall_at_6: 0.1776
+Epoch 117/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7630 - loss: 0.4923 - recall_at_6: 0.2938 - val_hits_at_6: 1.0592 - val_loss: 0.5115 - val_recall_at_6: 0.1765
+Epoch 118/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7495 - loss: 0.4923 - recall_at_6: 0.2916 - val_hits_at_6: 1.0526 - val_loss: 0.5120 - val_recall_at_6: 0.1754
+Epoch 119/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7932 - loss: 0.4913 - recall_at_6: 0.2989 - val_hits_at_6: 1.0197 - val_loss: 0.5128 - val_recall_at_6: 0.1700
+Epoch 120/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7645 - loss: 0.4910 - recall_at_6: 0.2941 - val_hits_at_6: 1.0461 - val_loss: 0.5130 - val_recall_at_6: 0.1743
+Epoch 121/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.8053 - loss: 0.4910 - recall_at_6: 0.3009 - val_hits_at_6: 1.0658 - val_loss: 0.5130 - val_recall_at_6: 0.1776
+Epoch 122/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.8292 - loss: 0.4901 - recall_at_6: 0.3049 - val_hits_at_6: 1.0329 - val_loss: 0.5144 - val_recall_at_6: 0.1721
+Epoch 123/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.7819 - loss: 0.4907 - recall_at_6: 0.2970 - val_hits_at_6: 1.0592 - val_loss: 0.5147 - val_recall_at_6: 0.1765
+Epoch 124/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.8214 - loss: 0.4903 - recall_at_6: 0.3036 - val_hits_at_6: 1.0592 - val_loss: 0.5140 - val_recall_at_6: 0.1765
+Epoch 125/500
+74/74 - 0s - 2ms/step - hits_at_6: 1.8516 - loss: 0.4893 - recall_at_6: 0.3086 - val_hits_at_6: 1.0526 - val_loss: 0.5155 - val_recall_at_6: 0.1754
 Training Transformer model...
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 Epoch 1/1000
-74/74 - 3s - 46ms/step - hits_at_6: 0.8822 - loss: 2.4508 - recall_at_6: 0.1470 - val_hits_at_6: 0.9803 - val_loss: 2.4177 - val_recall_at_6: 0.1634
+74/74 - 3s - 47ms/step - hits_at_6: 0.8900 - loss: 2.4242 - recall_at_6: 0.1483 - val_hits_at_6: 0.8750 - val_loss: 2.4177 - val_recall_at_6: 0.1458
 Epoch 2/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8774 - loss: 2.4178 - recall_at_6: 0.1462 - val_hits_at_6: 0.9934 - val_loss: 2.4177 - val_recall_at_6: 0.1656
+74/74 - 0s - 3ms/step - hits_at_6: 0.9158 - loss: 2.4177 - recall_at_6: 0.1526 - val_hits_at_6: 0.8816 - val_loss: 2.4177 - val_recall_at_6: 0.1469
 Epoch 3/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8866 - loss: 2.4177 - recall_at_6: 0.1478 - val_hits_at_6: 0.9803 - val_loss: 2.4177 - val_recall_at_6: 0.1634
+74/74 - 0s - 3ms/step - hits_at_6: 0.9047 - loss: 2.4178 - recall_at_6: 0.1508 - val_hits_at_6: 0.8618 - val_loss: 2.4177 - val_recall_at_6: 0.1436
 Epoch 4/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8579 - loss: 2.4177 - recall_at_6: 0.1430 - val_hits_at_6: 0.9803 - val_loss: 2.4177 - val_recall_at_6: 0.1634
+74/74 - 0s - 3ms/step - hits_at_6: 0.8890 - loss: 2.4177 - recall_at_6: 0.1482 - val_hits_at_6: 0.8487 - val_loss: 2.4177 - val_recall_at_6: 0.1414
 Epoch 5/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8632 - loss: 2.4177 - recall_at_6: 0.1439 - val_hits_at_6: 0.9803 - val_loss: 2.4177 - val_recall_at_6: 0.1634
+74/74 - 0s - 3ms/step - hits_at_6: 0.9648 - loss: 2.4177 - recall_at_6: 0.1608 - val_hits_at_6: 0.8487 - val_loss: 2.4177 - val_recall_at_6: 0.1414
 Epoch 6/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9211 - loss: 2.4179 - recall_at_6: 0.1535 - val_hits_at_6: 1.0132 - val_loss: 2.4177 - val_recall_at_6: 0.1689
+74/74 - 0s - 3ms/step - hits_at_6: 0.9167 - loss: 2.4177 - recall_at_6: 0.1528 - val_hits_at_6: 0.8487 - val_loss: 2.4177 - val_recall_at_6: 0.1414
 Epoch 7/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9247 - loss: 2.4177 - recall_at_6: 0.1541 - val_hits_at_6: 1.0132 - val_loss: 2.4177 - val_recall_at_6: 0.1689
+74/74 - 0s - 3ms/step - hits_at_6: 0.8511 - loss: 2.4177 - recall_at_6: 0.1419 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 8/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9204 - loss: 2.4179 - recall_at_6: 0.1534 - val_hits_at_6: 1.0329 - val_loss: 2.4177 - val_recall_at_6: 0.1721
+74/74 - 0s - 3ms/step - hits_at_6: 0.9389 - loss: 2.4177 - recall_at_6: 0.1565 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 9/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8950 - loss: 2.4177 - recall_at_6: 0.1492 - val_hits_at_6: 1.0395 - val_loss: 2.4177 - val_recall_at_6: 0.1732
+74/74 - 0s - 3ms/step - hits_at_6: 0.8603 - loss: 2.4177 - recall_at_6: 0.1434 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 10/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8885 - loss: 2.4177 - recall_at_6: 0.1481 - val_hits_at_6: 1.0395 - val_loss: 2.4177 - val_recall_at_6: 0.1732
+74/74 - 0s - 3ms/step - hits_at_6: 0.8769 - loss: 2.4177 - recall_at_6: 0.1462 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 11/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9119 - loss: 2.4177 - recall_at_6: 0.1520 - val_hits_at_6: 1.0395 - val_loss: 2.4177 - val_recall_at_6: 0.1732
+74/74 - 0s - 3ms/step - hits_at_6: 0.8716 - loss: 2.4177 - recall_at_6: 0.1453 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 12/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8458 - loss: 2.4177 - recall_at_6: 0.1410 - val_hits_at_6: 1.0395 - val_loss: 2.4177 - val_recall_at_6: 0.1732
+74/74 - 0s - 3ms/step - hits_at_6: 0.8953 - loss: 2.4177 - recall_at_6: 0.1492 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 13/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9276 - loss: 2.4177 - recall_at_6: 0.1546 - val_hits_at_6: 1.0395 - val_loss: 2.4177 - val_recall_at_6: 0.1732
+74/74 - 0s - 3ms/step - hits_at_6: 0.9042 - loss: 2.4177 - recall_at_6: 0.1507 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 14/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9066 - loss: 2.4177 - recall_at_6: 0.1511 - val_hits_at_6: 1.0263 - val_loss: 2.4177 - val_recall_at_6: 0.1711
+74/74 - 0s - 3ms/step - hits_at_6: 0.9377 - loss: 2.4177 - recall_at_6: 0.1563 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 15/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8526 - loss: 2.4177 - recall_at_6: 0.1421 - val_hits_at_6: 1.0263 - val_loss: 2.4177 - val_recall_at_6: 0.1711
+74/74 - 0s - 3ms/step - hits_at_6: 0.8834 - loss: 2.4177 - recall_at_6: 0.1472 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 16/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9677 - loss: 2.4177 - recall_at_6: 0.1613 - val_hits_at_6: 1.0263 - val_loss: 2.4177 - val_recall_at_6: 0.1711
+74/74 - 0s - 3ms/step - hits_at_6: 0.9467 - loss: 2.4177 - recall_at_6: 0.1578 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 17/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9245 - loss: 2.4177 - recall_at_6: 0.1541 - val_hits_at_6: 1.0263 - val_loss: 2.4177 - val_recall_at_6: 0.1711
+74/74 - 0s - 3ms/step - hits_at_6: 0.9151 - loss: 2.4177 - recall_at_6: 0.1525 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 18/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8897 - loss: 2.4177 - recall_at_6: 0.1483 - val_hits_at_6: 1.0263 - val_loss: 2.4177 - val_recall_at_6: 0.1711
+74/74 - 0s - 3ms/step - hits_at_6: 0.8958 - loss: 2.4177 - recall_at_6: 0.1493 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 19/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.9365 - loss: 2.4177 - recall_at_6: 0.1561 - val_hits_at_6: 1.0263 - val_loss: 2.4177 - val_recall_at_6: 0.1711
+74/74 - 0s - 3ms/step - hits_at_6: 0.8605 - loss: 2.4177 - recall_at_6: 0.1434 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Epoch 20/1000
-74/74 - 0s - 3ms/step - hits_at_6: 0.8687 - loss: 2.4177 - recall_at_6: 0.1448 - val_hits_at_6: 1.0263 - val_loss: 2.4177 - val_recall_at_6: 0.1711
+74/74 - 0s - 3ms/step - hits_at_6: 0.8415 - loss: 2.4177 - recall_at_6: 0.1402 - val_hits_at_6: 0.8355 - val_loss: 2.4177 - val_recall_at_6: 0.1393
 Training GNN model...
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 Epoch 1/500
-74/74 - 2s - 31ms/step - hits_at_6: 0.9911 - loss: 1.2240 - recall_at_6: 0.1652 - val_hits_at_6: 0.9539 - val_loss: 0.5320 - val_recall_at_6: 0.1590
+74/74 - 2s - 31ms/step - hits_at_6: 0.9766 - loss: 1.6874 - recall_at_6: 0.1628 - val_hits_at_6: 0.8882 - val_loss: 0.5849 - val_recall_at_6: 0.1480
 Epoch 2/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9474 - loss: 0.7778 - recall_at_6: 0.1579 - val_hits_at_6: 1.0000 - val_loss: 0.5338 - val_recall_at_6: 0.1667
+74/74 - 0s - 2ms/step - hits_at_6: 0.9221 - loss: 0.8438 - recall_at_6: 0.1537 - val_hits_at_6: 0.8684 - val_loss: 0.5286 - val_recall_at_6: 0.1447
 Epoch 3/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9269 - loss: 0.6758 - recall_at_6: 0.1545 - val_hits_at_6: 0.9605 - val_loss: 0.5274 - val_recall_at_6: 0.1601
+74/74 - 0s - 2ms/step - hits_at_6: 0.8465 - loss: 0.6755 - recall_at_6: 0.1411 - val_hits_at_6: 0.9079 - val_loss: 0.5325 - val_recall_at_6: 0.1513
 Epoch 4/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8873 - loss: 0.6249 - recall_at_6: 0.1479 - val_hits_at_6: 0.9605 - val_loss: 0.5209 - val_recall_at_6: 0.1601
+74/74 - 0s - 2ms/step - hits_at_6: 0.8856 - loss: 0.6128 - recall_at_6: 0.1476 - val_hits_at_6: 0.9605 - val_loss: 0.5274 - val_recall_at_6: 0.1601
 Epoch 5/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9167 - loss: 0.6003 - recall_at_6: 0.1528 - val_hits_at_6: 0.9079 - val_loss: 0.5219 - val_recall_at_6: 0.1513
+74/74 - 0s - 2ms/step - hits_at_6: 0.8617 - loss: 0.5877 - recall_at_6: 0.1436 - val_hits_at_6: 0.8289 - val_loss: 0.5250 - val_recall_at_6: 0.1382
 Epoch 6/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8880 - loss: 0.5839 - recall_at_6: 0.1480 - val_hits_at_6: 0.9605 - val_loss: 0.5156 - val_recall_at_6: 0.1601
+74/74 - 0s - 2ms/step - hits_at_6: 0.9558 - loss: 0.5797 - recall_at_6: 0.1593 - val_hits_at_6: 0.8816 - val_loss: 0.5226 - val_recall_at_6: 0.1469
 Epoch 7/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9102 - loss: 0.5670 - recall_at_6: 0.1517 - val_hits_at_6: 0.9342 - val_loss: 0.5154 - val_recall_at_6: 0.1557
+74/74 - 0s - 2ms/step - hits_at_6: 0.9800 - loss: 0.5699 - recall_at_6: 0.1633 - val_hits_at_6: 0.8224 - val_loss: 0.5230 - val_recall_at_6: 0.1371
 Epoch 8/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9447 - loss: 0.5548 - recall_at_6: 0.1575 - val_hits_at_6: 0.9737 - val_loss: 0.5136 - val_recall_at_6: 0.1623
+74/74 - 0s - 2ms/step - hits_at_6: 0.9192 - loss: 0.5599 - recall_at_6: 0.1532 - val_hits_at_6: 0.8750 - val_loss: 0.5214 - val_recall_at_6: 0.1458
 Epoch 9/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9047 - loss: 0.5460 - recall_at_6: 0.1508 - val_hits_at_6: 0.9539 - val_loss: 0.5136 - val_recall_at_6: 0.1590
+74/74 - 0s - 2ms/step - hits_at_6: 0.8892 - loss: 0.5543 - recall_at_6: 0.1482 - val_hits_at_6: 0.8618 - val_loss: 0.5224 - val_recall_at_6: 0.1436
 Epoch 10/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9020 - loss: 0.5398 - recall_at_6: 0.1503 - val_hits_at_6: 0.9342 - val_loss: 0.5131 - val_recall_at_6: 0.1557
+74/74 - 0s - 2ms/step - hits_at_6: 0.8610 - loss: 0.5483 - recall_at_6: 0.1435 - val_hits_at_6: 0.8750 - val_loss: 0.5179 - val_recall_at_6: 0.1458
 Epoch 11/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8779 - loss: 0.5326 - recall_at_6: 0.1463 - val_hits_at_6: 0.9408 - val_loss: 0.5123 - val_recall_at_6: 0.1568
+74/74 - 0s - 2ms/step - hits_at_6: 0.8552 - loss: 0.5483 - recall_at_6: 0.1425 - val_hits_at_6: 0.9211 - val_loss: 0.5163 - val_recall_at_6: 0.1535
 Epoch 12/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8909 - loss: 0.5284 - recall_at_6: 0.1485 - val_hits_at_6: 0.9474 - val_loss: 0.5126 - val_recall_at_6: 0.1579
+74/74 - 0s - 2ms/step - hits_at_6: 0.9018 - loss: 0.5405 - recall_at_6: 0.1503 - val_hits_at_6: 0.9079 - val_loss: 0.5166 - val_recall_at_6: 0.1513
 Epoch 13/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9488 - loss: 0.5232 - recall_at_6: 0.1581 - val_hits_at_6: 0.9474 - val_loss: 0.5125 - val_recall_at_6: 0.1579
+74/74 - 0s - 2ms/step - hits_at_6: 0.8709 - loss: 0.5344 - recall_at_6: 0.1451 - val_hits_at_6: 0.8421 - val_loss: 0.5161 - val_recall_at_6: 0.1404
 Epoch 14/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9315 - loss: 0.5205 - recall_at_6: 0.1552 - val_hits_at_6: 0.8947 - val_loss: 0.5118 - val_recall_at_6: 0.1491
+74/74 - 0s - 2ms/step - hits_at_6: 0.8902 - loss: 0.5329 - recall_at_6: 0.1484 - val_hits_at_6: 0.7500 - val_loss: 0.5161 - val_recall_at_6: 0.1250
 Epoch 15/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9295 - loss: 0.5172 - recall_at_6: 0.1549 - val_hits_at_6: 0.9342 - val_loss: 0.5116 - val_recall_at_6: 0.1557
+74/74 - 0s - 2ms/step - hits_at_6: 0.8390 - loss: 0.5306 - recall_at_6: 0.1398 - val_hits_at_6: 0.7368 - val_loss: 0.5157 - val_recall_at_6: 0.1228
 Epoch 16/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8871 - loss: 0.5160 - recall_at_6: 0.1478 - val_hits_at_6: 0.8618 - val_loss: 0.5109 - val_recall_at_6: 0.1436
+74/74 - 0s - 2ms/step - hits_at_6: 0.9245 - loss: 0.5274 - recall_at_6: 0.1541 - val_hits_at_6: 0.7697 - val_loss: 0.5148 - val_recall_at_6: 0.1283
 Epoch 17/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8755 - loss: 0.5131 - recall_at_6: 0.1459 - val_hits_at_6: 0.8947 - val_loss: 0.5098 - val_recall_at_6: 0.1491
+74/74 - 0s - 2ms/step - hits_at_6: 0.9551 - loss: 0.5257 - recall_at_6: 0.1592 - val_hits_at_6: 0.7632 - val_loss: 0.5136 - val_recall_at_6: 0.1272
 Epoch 18/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9570 - loss: 0.5105 - recall_at_6: 0.1595 - val_hits_at_6: 0.8882 - val_loss: 0.5089 - val_recall_at_6: 0.1480
+74/74 - 0s - 2ms/step - hits_at_6: 0.9035 - loss: 0.5238 - recall_at_6: 0.1506 - val_hits_at_6: 0.7566 - val_loss: 0.5142 - val_recall_at_6: 0.1261
 Epoch 19/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.8448 - loss: 0.5106 - recall_at_6: 0.1408 - val_hits_at_6: 0.8882 - val_loss: 0.5082 - val_recall_at_6: 0.1480
+74/74 - 0s - 2ms/step - hits_at_6: 0.8745 - loss: 0.5215 - recall_at_6: 0.1458 - val_hits_at_6: 0.7829 - val_loss: 0.5140 - val_recall_at_6: 0.1305
 Epoch 20/500
-74/74 - 0s - 2ms/step - hits_at_6: 0.9438 - loss: 0.5085 - recall_at_6: 0.1573 - val_hits_at_6: 0.8684 - val_loss: 0.5077 - val_recall_at_6: 0.1447
+74/74 - 0s - 2ms/step - hits_at_6: 0.9013 - loss: 0.5208 - recall_at_6: 0.1502 - val_hits_at_6: 0.8224 - val_loss: 0.5140 - val_recall_at_6: 0.1371
 GNN model training complete.
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
@@ -566,136 +706,125 @@ GNN model training complete.
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
 [TRAIN] keras.Model.compile patched: {"set_loss": true, "rank_w": 0.15, "reward_w": 0.15, "tau": 0.05, "pair_neg": 20, "add_metrics": true}
-[RUN] {"type": "predict_log", "ts": "2025-11-20T18:07:27+00:00", "hmmlearn": "0.3.3", "blend_weights": [0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666], "calibration": null, "per_expert_pl_nll": {"Bayes": 22.041119355943433, "Markov": 22.03441566361796, "HMM": 22.00015343785005, "LSTM": 22.133284890596, "Transformer": 23.102670393383598, "GNN": 22.065246073454556}, "weekday_gate": null, "feedback": {"window": 90, "t_fit": 747, "brier": 0.14315185935965602, "logloss": 0.5757081282262255}}
-[MISS t=599] hits=1 top6=[6, 4, 9, 17, 19, 30] truth=[4, 14, 18, 25, 32, 38] low_truth=[25, 14] overconf=[6, 9]
-[MISS t=600] hits=1 top6=[9, 13, 15, 23, 4, 29] truth=[3, 11, 17, 22, 23, 36] low_truth=[22, 36] overconf=[9, 13]
-[MISS t=601] hits=0 top6=[20, 17, 40, 21, 33, 6] truth=[10, 14, 19, 28, 36, 39] low_truth=[10, 19] overconf=[20, 17]
-[MISS t=603] hits=0 top6=[9, 5, 15, 29, 21, 33] truth=[6, 10, 26, 30, 34, 36] low_truth=[36, 26] overconf=[9, 5]
-[MISS t=604] hits=1 top6=[33, 9, 4, 40, 35, 11] truth=[7, 10, 11, 18, 19, 31] low_truth=[19, 7] overconf=[33, 9]
-[MISS t=606] hits=1 top6=[16, 40, 37, 21, 20, 13] truth=[13, 14, 24, 25, 27, 34] low_truth=[25, 34] overconf=[16, 40]
-[MISS t=607] hits=1 top6=[12, 29, 4, 3, 13, 14] truth=[12, 17, 19, 26, 28, 36] low_truth=[19, 28] overconf=[29, 4]
-[MISS t=608] hits=0 top6=[4, 12, 33, 17, 3, 20] truth=[1, 2, 13, 31, 36, 37] low_truth=[31, 2] overconf=[4, 12]
-[MISS t=609] hits=0 top6=[20, 33, 8, 4, 37, 9] truth=[2, 3, 14, 25, 28, 36] low_truth=[25, 36] overconf=[20, 33]
-[MISS t=610] hits=1 top6=[16, 4, 33, 40, 28, 9] truth=[7, 14, 15, 22, 28, 31] low_truth=[31, 7] overconf=[16, 4]
-[MISS t=611] hits=0 top6=[29, 4, 9, 8, 16, 13] truth=[12, 19, 21, 37, 38, 40] low_truth=[19, 12] overconf=[29, 4]
-[MISS t=612] hits=1 top6=[10, 35, 16, 29, 4, 9] truth=[5, 11, 15, 26, 35, 36] low_truth=[15, 11] overconf=[10, 16]
-[MISS t=613] hits=0 top6=[29, 4, 23, 33, 8, 6] truth=[1, 18, 24, 28, 31, 34] low_truth=[1, 31] overconf=[29, 4]
-[MISS t=614] hits=0 top6=[4, 33, 32, 16, 30, 3] truth=[14, 26, 27, 31, 36, 37] low_truth=[36, 31] overconf=[4, 33]
-[MISS t=616] hits=1 top6=[4, 9, 3, 29, 30, 6] truth=[5, 9, 21, 25, 35, 39] low_truth=[5, 35] overconf=[4, 3]
-[MISS t=617] hits=0 top6=[6, 8, 20, 33, 32, 10] truth=[2, 13, 14, 16, 21, 25] low_truth=[14, 2] overconf=[6, 8]
-[MISS t=618] hits=0 top6=[17, 4, 29, 13, 9, 6] truth=[7, 8, 14, 30, 37, 40] low_truth=[40, 14] overconf=[17, 4]
-[MISS t=619] hits=0 top6=[4, 10, 8, 6, 37, 20] truth=[7, 23, 25, 27, 32, 35] low_truth=[35, 25] overconf=[4, 10]
-[MISS t=620] hits=1 top6=[4, 6, 3, 20, 10, 17] truth=[7, 17, 22, 33, 36, 40] low_truth=[7, 36] overconf=[4, 6]
-[MISS t=621] hits=1 top6=[6, 4, 20, 10, 29, 3] truth=[1, 3, 8, 30, 34, 38] low_truth=[30, 1] overconf=[6, 4]
-[MISS t=623] hits=1 top6=[10, 29, 9, 28, 5, 4] truth=[10, 13, 14, 16, 27, 39] low_truth=[14, 39] overconf=[29, 9]
-[MISS t=624] hits=1 top6=[29, 6, 9, 18, 28, 20] truth=[7, 18, 24, 31, 35, 40] low_truth=[35, 40] overconf=[29, 6]
-[MISS t=625] hits=0 top6=[17, 6, 18, 33, 28, 19] truth=[5, 11, 20, 23, 25, 27] low_truth=[5, 25] overconf=[17, 6]
-[MISS t=627] hits=0 top6=[9, 29, 2, 37, 6, 28] truth=[14, 17, 19, 23, 24, 26] low_truth=[19, 23] overconf=[9, 29]
-[MISS t=628] hits=0 top6=[17, 9, 6, 29, 2, 14] truth=[4, 8, 18, 19, 35, 37] low_truth=[35, 8] overconf=[17, 9]
-[MISS t=629] hits=1 top6=[6, 28, 8, 9, 29, 10] truth=[1, 3, 23, 27, 28, 36] low_truth=[1, 23] overconf=[6, 8]/Users/coleoehlrich/Colorado_Lotto/Lotto+.py:5932: UserWarning: Reliability export failed: No module named 'matplotlib'
+[RUN] {"type": "predict_log", "ts": "2025-11-20T21:29:27+00:00", "hmmlearn": "0.3.3", "blend_weights": [0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666], "calibration": null, "per_expert_pl_nll": {"Bayes": 22.041119355943433, "Markov": 22.03441566361796, "HMM": 22.747896011616405, "LSTM": 22.13507953023867, "Transformer": 22.07697909695822, "GNN": 22.26658490343469}, "weekday_gate": null, "feedback": {"window": 90, "t_fit": 747, "brier": 0.1431620835550978, "logloss": 0.5758997504126504}}
+[MISS t=599] hits=1 top6=[3, 21, 6, 32, 13, 20] truth=[4, 14, 18, 25, 32, 38] low_truth=[25, 38] overconf=[3, 21]
+[MISS t=601] hits=0 top6=[29, 17, 4, 3, 6, 11] truth=[10, 14, 19, 28, 36, 39] low_truth=[39, 19] overconf=[29, 17]
+[MISS t=603] hits=0 top6=[38, 14, 29, 9, 8, 37] truth=[6, 10, 26, 30, 34, 36] low_truth=[36, 26] overconf=[38, 14]
+[MISS t=606] hits=0 top6=[10, 6, 30, 8, 18, 17] truth=[13, 14, 24, 25, 27, 34] low_truth=[24, 25] overconf=[10, 6]
+[MISS t=607] hits=0 top6=[25, 3, 30, 14, 6, 4] truth=[12, 17, 19, 26, 28, 36] low_truth=[36, 28] overconf=[25, 3]
+[MISS t=608] hits=0 top6=[19, 4, 10, 7, 8, 17] truth=[1, 2, 13, 31, 36, 37] low_truth=[31, 1] overconf=[19, 4]
+[MISS t=609] hits=0 top6=[10, 11, 1, 19, 37, 13] truth=[2, 3, 14, 25, 28, 36] low_truth=[25, 28] overconf=[10, 11]
+[MISS t=611] hits=0 top6=[33, 10, 31, 14, 6, 17] truth=[12, 19, 21, 37, 38, 40] low_truth=[37, 21] overconf=[33, 10]
+[MISS t=612] hits=0 top6=[19, 10, 21, 6, 40, 9] truth=[5, 11, 15, 26, 35, 36] low_truth=[5, 15] overconf=[19, 10]
+[MISS t=613] hits=0 top6=[9, 14, 5, 17, 33, 20] truth=[1, 18, 24, 28, 31, 34] low_truth=[1, 31] overconf=[9, 14]
+[MISS t=615] hits=1 top6=[10, 8, 3, 4, 40, 27] truth=[7, 23, 24, 27, 33, 34] low_truth=[34, 7] overconf=[10, 8]
+[MISS t=616] hits=0 top6=[6, 10, 13, 33, 17, 27] truth=[5, 9, 21, 25, 35, 39] low_truth=[5, 39] overconf=[6, 10]
+[MISS t=618] hits=1 top6=[14, 13, 4, 6, 17, 28] truth=[7, 8, 14, 30, 37, 40] low_truth=[7, 30] overconf=[13, 4]
+[MISS t=619] hits=0 top6=[14, 13, 4, 6, 3, 30] truth=[7, 23, 25, 27, 32, 35] low_truth=[35, 32] overconf=[14, 13]
+[MISS t=620] hits=1 top6=[13, 4, 10, 33, 38, 6] truth=[7, 17, 22, 33, 36, 40] low_truth=[36, 22] overconf=[13, 4]
+[MISS t=621] hits=1 top6=[11, 9, 6, 3, 17, 33] truth=[1, 3, 8, 30, 34, 38] low_truth=[1, 34] overconf=[11, 9]
+[MISS t=622] hits=1 top6=[14, 38, 13, 29, 37, 30] truth=[4, 12, 16, 26, 35, 38] low_truth=[35, 16] overconf=[14, 13]
+[MISS t=623] hits=1 top6=[33, 8, 35, 10, 3, 25] truth=[10, 13, 14, 16, 27, 39] low_truth=[39, 14] overconf=[33, 8]
+[MISS t=624] hits=0 top6=[14, 37, 27, 19, 4, 29] truth=[7, 18, 24, 31, 35, 40] low_truth=[35, 31] overconf=[14, 37]
+[MISS t=625] hits=0 top6=[7, 10, 33, 21, 35, 9] truth=[5, 11, 20, 23, 25, 27] low_truth=[25, 20] overconf=[7, 10]
+[MISS t=626] hits=0 top6=[23, 27, 3, 4, 40, 11] truth=[15, 33, 35, 37, 38, 39] low_truth=[15, 39] overconf=[23, 27]
+[MISS t=627] hits=0 top6=[33, 35, 9, 37, 8, 3] truth=[14, 17, 19, 23, 24, 26] low_truth=[24, 26] overconf=[33, 35]
+[MISS t=629] hits=1 top6=[35, 19, 27, 10, 8, 30] truth=[1, 3, 23, 27, 28, 36] low_truth=[1, 36] overconf=[35, 19]
+[MISS t=630] hits=1 top6=[28, 23, 10, 33, 2, 38] truth=[2, 12, 18, 25, 37, 39] low_truth=[39, 25] overconf=[28, 23]
+[MISS t=631] hits=1 top6=[10, 37, 6, 3, 14, 33] truth=[4, 12, 21, 22, 33, 40] low_truth=[21, 12] overconf=[10, 37]
+[MISS t=633] hits=1 top6=[14, 37, 17, 33, 30, 2] truth=[5, 9, 16, 17, 32, 38] low_truth=[5, 32] overconf=[14, 37]/Users/coleoehlrich/Colorado_Lotto/Lotto+.py:5932: UserWarning: Reliability export failed: No module named 'matplotlib'
   import warnings; warnings.warn(f"Reliability export failed: {e}")
-/Users/coleoehlrich/Colorado_Lotto/Lotto+.py:7925: UserWarning: Ensemble computation failed: _build_hmm_prob_from_subset() got an unexpected keyword argument 'n_seeds'
-  warnings.warn(f"Ensemble computation failed: {e}")
 
-[MISS t=630] hits=0 top6=[29, 9, 6, 23, 28, 10] truth=[2, 12, 18, 25, 37, 39] low_truth=[18, 39] overconf=[29, 9]
-[MISS t=632] hits=0 top6=[29, 4, 6, 10, 9, 28] truth=[2, 14, 30, 33, 36, 37] low_truth=[2, 14] overconf=[29, 4]
-[MISS t=634] hits=1 top6=[9, 14, 6, 17, 38, 13] truth=[9, 16, 18, 22, 25, 31] low_truth=[22, 25] overconf=[14, 6]
-[MISS t=635] hits=0 top6=[6, 9, 17, 8, 10, 28] truth=[18, 20, 22, 27, 30, 32] low_truth=[22, 32] overconf=[6, 9]
-[MISS t=636] hits=0 top6=[11, 29, 8, 6, 17, 30] truth=[15, 18, 24, 25, 33, 40] low_truth=[25, 15] overconf=[11, 29]
-[MISS t=637] hits=1 top6=[6, 29, 33, 8, 13, 21] truth=[14, 18, 21, 25, 27, 39] low_truth=[39, 25] overconf=[6, 29]
-[MISS t=638] hits=1 top6=[6, 4, 26, 10, 23, 38] truth=[8, 10, 11, 12, 13, 31] low_truth=[31, 11] overconf=[6, 4]
-[MISS t=639] hits=0 top6=[13, 10, 6, 23, 28, 4] truth=[2, 8, 9, 14, 19, 36] low_truth=[2, 14] overconf=[13, 10]
-[MISS t=640] hits=0 top6=[6, 38, 14, 2, 3, 19] truth=[11, 27, 28, 30, 33, 40] low_truth=[27, 11] overconf=[6, 38]
-[MISS t=641] hits=1 top6=[17, 6, 38, 23, 26, 10] truth=[2, 3, 9, 23, 27, 34] low_truth=[27, 2] overconf=[17, 6]
-[MISS t=643] hits=1 top6=[4, 29, 38, 30, 1, 37] truth=[9, 15, 18, 29, 31, 33] low_truth=[31, 33] overconf=[4, 38]
-[MISS t=644] hits=1 top6=[6, 20, 21, 9, 35, 17] truth=[2, 3, 5, 6, 14, 27] low_truth=[2, 27] overconf=[20, 21]
-[MISS t=645] hits=1 top6=[6, 10, 37, 14, 17, 33] truth=[8, 15, 21, 31, 37, 39] low_truth=[31, 39] overconf=[6, 10]
-[MISS t=646] hits=1 top6=[38, 8, 21, 4, 35, 17] truth=[1, 10, 20, 25, 37, 38] low_truth=[25, 1] overconf=[8, 21]
-[MISS t=648] hits=1 top6=[17, 30, 16, 18, 28, 8] truth=[4, 11, 22, 30, 34, 35] low_truth=[35, 22] overconf=[17, 16]
-[MISS t=651] hits=0 top6=[16, 33, 2, 18, 14, 30] truth=[3, 9, 12, 13, 25, 36] low_truth=[36, 25] overconf=[16, 33]
-[MISS t=652] hits=0 top6=[33, 18, 7, 12, 29, 17] truth=[5, 9, 27, 30, 35, 36] low_truth=[5, 30] overconf=[33, 18]
-[MISS t=653] hits=1 top6=[23, 18, 10, 37, 33, 26] truth=[4, 7, 16, 18, 21, 36] low_truth=[36, 16] overconf=[23, 10]
-[MISS t=654] hits=1 top6=[7, 14, 6, 23, 9, 33] truth=[5, 8, 11, 16, 23, 24] low_truth=[11, 5] overconf=[7, 14]
-[MISS t=656] hits=0 top6=[17, 10, 33, 6, 3, 4] truth=[19, 25, 26, 32, 37, 40] low_truth=[32, 25] overconf=[17, 10]
-[MISS t=657] hits=0 top6=[3, 33, 11, 18, 20, 22] truth=[7, 9, 17, 21, 26, 30] low_truth=[7, 9] overconf=[3, 33]
-[MISS t=658] hits=0 top6=[17, 9, 30, 29, 3, 16] truth=[11, 14, 15, 18, 27, 37] low_truth=[15, 18] overconf=[17, 9]
-[MISS t=659] hits=1 top6=[33, 31, 3, 2, 37, 6] truth=[1, 6, 25, 27, 28, 38] low_truth=[1, 25] overconf=[33, 31]
-[MISS t=660] hits=1 top6=[33, 10, 4, 28, 22, 13] truth=[12, 16, 20, 29, 33, 38] low_truth=[29, 38] overconf=[10, 4]
-[MISS t=661] hits=1 top6=[11, 33, 13, 8, 34, 3] truth=[19, 23, 31, 34, 35, 38] low_truth=[38, 35] overconf=[11, 33]
-[MISS t=662] hits=0 top6=[4, 13, 8, 3, 10, 23] truth=[5, 6, 15, 37, 38, 40] low_truth=[15, 38] overconf=[4, 13]
-[MISS t=663] hits=1 top6=[10, 22, 33, 14, 2, 18] truth=[17, 18, 19, 25, 27, 28] low_truth=[25, 19] overconf=[10, 22]
-[MISS t=665] hits=1 top6=[4, 39, 8, 11, 13, 30] truth=[2, 15, 17, 29, 34, 39] low_truth=[15, 29] overconf=[4, 8]
-[MISS t=667] hits=0 top6=[4, 14, 9, 23, 8, 10] truth=[5, 7, 11, 12, 22, 28] low_truth=[7, 11] overconf=[4, 14]
-[MISS t=668] hits=1 top6=[10, 4, 30, 21, 9, 33] truth=[4, 5, 8, 14, 18, 37] low_truth=[14, 5] overconf=[10, 30]
-[MISS t=669] hits=0 top6=[13, 26, 4, 21, 40, 6] truth=[2, 8, 20, 24, 29, 32] low_truth=[20, 24] overconf=[13, 26]
-[MISS t=670] hits=0 top6=[32, 13, 4, 3, 33, 24] truth=[7, 17, 19, 27, 29, 36] low_truth=[7, 19] overconf=[32, 13]
-[MISS t=671] hits=1 top6=[13, 38, 4, 10, 6, 31] truth=[5, 8, 15, 27, 35, 38] low_truth=[15, 35] overconf=[13, 4]
-[MISS t=672] hits=0 top6=[10, 33, 3, 6, 26, 9] truth=[1, 2, 12, 13, 22, 32] low_truth=[32, 22] overconf=[10, 33]
-[MISS t=673] hits=1 top6=[33, 26, 6, 30, 9, 4] truth=[6, 10, 22, 28, 31, 35] low_truth=[22, 35] overconf=[33, 26]
-[MISS t=674] hits=0 top6=[26, 37, 38, 30, 10, 9] truth=[3, 5, 12, 21, 24, 29] low_truth=[24, 5] overconf=[26, 37]
-[MISS t=676] hits=1 top6=[30, 4, 14, 37, 10, 23] truth=[5, 7, 10, 12, 15, 32] low_truth=[32, 7] overconf=[30, 4]
-[MISS t=677] hits=0 top6=[14, 37, 9, 30, 4, 33] truth=[5, 18, 20, 25, 39, 40] low_truth=[39, 40] overconf=[14, 37]
-[MISS t=678] hits=1 top6=[4, 8, 33, 30, 23, 27] truth=[2, 7, 21, 27, 28, 40] low_truth=[2, 21] overconf=[4, 8]
-[MISS t=679] hits=1 top6=[26, 37, 4, 9, 8, 33] truth=[14, 24, 30, 33, 36, 38] low_truth=[24, 36] overconf=[26, 37]
-[MISS t=680] hits=0 top6=[38, 30, 9, 37, 6, 17] truth=[2, 4, 8, 18, 20, 26] low_truth=[20, 8] overconf=[38, 30]
-[MISS t=681] hits=0 top6=[38, 6, 17, 26, 3, 4] truth=[1, 8, 15, 23, 34, 37] low_truth=[34, 15] overconf=[38, 6]
-[MISS t=682] hits=1 top6=[1, 6, 32, 9, 37, 14] truth=[1, 10, 15, 16, 33, 34] low_truth=[34, 15] overconf=[6, 32]
-[MISS t=684] hits=0 top6=[9, 13, 11, 37, 30, 19] truth=[3, 6, 15, 16, 23, 33] low_truth=[33, 15] overconf=[9, 13]
-[MISS t=685] hits=0 top6=[6, 33, 14, 27, 16, 3] truth=[4, 9, 18, 21, 36, 37] low_truth=[9, 21] overconf=[6, 33]
-[MISS t=686] hits=0 top6=[30, 38, 11, 9, 4, 28] truth=[5, 10, 12, 22, 29, 37] low_truth=[5, 22] overconf=[30, 38]
-[MISS t=687] hits=0 top6=[33, 28, 12, 5, 36, 3] truth=[9, 11, 18, 19, 38, 39] low_truth=[39, 9] overconf=[33, 28]
-[MISS t=688] hits=1 top6=[30, 27, 19, 37, 9, 18] truth=[7, 8, 16, 18, 22, 32] low_truth=[16, 22] overconf=[30, 27]
-[MISS t=690] hits=1 top6=[25, 27, 6, 17, 20, 11] truth=[14, 17, 19, 22, 29, 39] low_truth=[22, 39] overconf=[25, 27]
-[MISS t=691] hits=1 top6=[2, 14, 31, 17, 30, 27] truth=[3, 9, 10, 12, 27, 38] low_truth=[12, 9] overconf=[2, 14]
-[MISS t=692] hits=1 top6=[4, 15, 6, 9, 31, 14] truth=[1, 12, 19, 26, 31, 35] low_truth=[1, 12] overconf=[4, 15]
-[MISS t=693] hits=0 top6=[4, 30, 20, 13, 28, 34] truth=[5, 8, 14, 25, 32, 37] low_truth=[32, 25] overconf=[4, 30]
-[MISS t=694] hits=0 top6=[37, 5, 13, 6, 28, 2] truth=[15, 24, 26, 32, 38, 39] low_truth=[39, 15] overconf=[37, 5]
-[MISS t=695] hits=0 top6=[2, 34, 18, 28, 9, 6] truth=[5, 16, 27, 29, 33, 40] low_truth=[40, 27] overconf=[2, 34]
-[MISS t=696] hits=1 top6=[4, 23, 28, 18, 3, 13] truth=[4, 15, 22, 27, 38, 40] low_truth=[15, 40] overconf=[23, 28]
-[MISS t=697] hits=1 top6=[30, 15, 28, 38, 23, 6] truth=[2, 16, 18, 27, 28, 40] low_truth=[2, 27] overconf=[30, 15]
-[MISS t=698] hits=0 top6=[9, 10, 21, 30, 13, 33] truth=[7, 8, 16, 19, 31, 35] low_truth=[31, 8] overconf=[9, 10]
-[MISS t=699] hits=1 top6=[6, 23, 30, 4, 9, 34] truth=[1, 6, 15, 25, 35, 38] low_truth=[15, 35] overconf=[23, 30]
-[MISS t=702] hits=1 top6=[14, 37, 9, 36, 30, 23] truth=[6, 11, 17, 18, 23, 32] low_truth=[32, 17] overconf=[14, 37]
-[MISS t=704] hits=1 top6=[14, 10, 20, 4, 37, 26] truth=[6, 14, 22, 32, 38, 39] low_truth=[32, 38] overconf=[10, 20]
-[MISS t=705] hits=1 top6=[4, 18, 5, 38, 6, 14] truth=[14, 30, 31, 34, 35, 36] low_truth=[35, 34] overconf=[4, 18]
-[MISS t=706] hits=1 top6=[3, 33, 8, 37, 29, 27] truth=[2, 4, 22, 29, 38, 39] low_truth=[39, 22] overconf=[3, 33]
-[MISS t=707] hits=1 top6=[3, 4, 13, 19, 10, 27] truth=[7, 8, 19, 20, 30, 35] low_truth=[7, 35] overconf=[3, 4]
-[MISS t=709] hits=1 top6=[16, 4, 37, 5, 17, 10] truth=[13, 23, 31, 33, 35, 37] low_truth=[31, 35] overconf=[16, 4]
-[MISS t=711] hits=1 top6=[40, 3, 9, 4, 10, 37] truth=[8, 9, 11, 21, 28, 38] low_truth=[38, 21] overconf=[40, 3]
-[MISS t=712] hits=0 top6=[9, 10, 28, 21, 4, 18] truth=[1, 12, 24, 33, 35, 36] low_truth=[1, 12] overconf=[9, 10]
-[MISS t=713] hits=1 top6=[4, 20, 1, 3, 36, 29] truth=[2, 14, 16, 23, 29, 40] low_truth=[16, 23] overconf=[4, 20]
-[MISS t=714] hits=1 top6=[29, 10, 17, 14, 18, 8] truth=[14, 15, 16, 31, 33, 34] low_truth=[34, 16] overconf=[29, 10]
-[MISS t=715] hits=0 top6=[6, 9, 18, 10, 28, 14] truth=[5, 13, 21, 25, 30, 33] low_truth=[21, 13] overconf=[6, 9]
-[MISS t=716] hits=0 top6=[6, 26, 4, 18, 13, 10] truth=[1, 29, 30, 32, 33, 40] low_truth=[1, 32] overconf=[6, 26]
-[MISS t=717] hits=1 top6=[20, 10, 8, 17, 6, 37] truth=[1, 2, 16, 20, 38, 39] low_truth=[2, 1] overconf=[10, 8]
-[MISS t=718] hits=1 top6=[6, 18, 37, 4, 3, 5] truth=[5, 8, 12, 16, 32, 36] low_truth=[32, 16] overconf=[6, 18]
-[MISS t=721] hits=0 top6=[6, 28, 27, 9, 18, 3] truth=[1, 11, 12, 13, 26, 40] low_truth=[1, 11] overconf=[6, 28]
-[MISS t=723] hits=1 top6=[33, 10, 14, 23, 19, 27] truth=[2, 8, 18, 19, 28, 39] low_truth=[39, 2] overconf=[33, 10]
-[MISS t=726] hits=0 top6=[7, 5, 19, 18, 6, 25] truth=[13, 15, 21, 34, 35, 37] low_truth=[34, 15] overconf=[7, 5]
-[MISS t=727] hits=0 top6=[14, 6, 20, 29, 25, 30] truth=[8, 10, 12, 28, 34, 37] low_truth=[12, 28] overconf=[14, 6]
-[MISS t=728] hits=1 top6=[10, 36, 4, 16, 33, 30] truth=[7, 15, 17, 28, 30, 31] low_truth=[15, 28] overconf=[10, 36]
-[MISS t=729] hits=0 top6=[9, 6, 3, 23, 36, 38] truth=[5, 7, 16, 29, 33, 34] low_truth=[34, 7] overconf=[9, 6]
-[MISS t=730] hits=0 top6=[9, 19, 38, 22, 20, 29] truth=[4, 7, 11, 21, 28, 39] low_truth=[21, 11] overconf=[9, 19]
-[MISS t=732] hits=1 top6=[14, 25, 9, 6, 38, 24] truth=[5, 7, 9, 19, 20, 39] low_truth=[7, 20] overconf=[14, 25]
-[MISS t=733] hits=0 top6=[9, 6, 38, 1, 20, 27] truth=[2, 7, 10, 14, 15, 21] low_truth=[7, 15] overconf=[9, 6]
-[MISS t=734] hits=1 top6=[22, 6, 38, 1, 26, 17] truth=[4, 15, 16, 22, 29, 31] low_truth=[31, 15] overconf=[6, 38]
-[MISS t=735] hits=0 top6=[6, 38, 23, 26, 14, 30] truth=[2, 10, 19, 25, 28, 35] low_truth=[2, 19] overconf=[6, 38]
-[MISS t=736] hits=0 top6=[27, 37, 33, 23, 38, 13] truth=[1, 5, 11, 14, 28, 32] low_truth=[5, 14] overconf=[27, 37]
-[MISS t=737] hits=1 top6=[30, 6, 36, 33, 37, 38] truth=[5, 19, 20, 25, 38, 39] low_truth=[20, 25] overconf=[30, 6]
-[MISS t=738] hits=0 top6=[18, 3, 23, 27, 36, 33] truth=[7, 12, 22, 32, 35, 38] low_truth=[32, 22] overconf=[18, 3]
-[MISS t=739] hits=1 top6=[18, 23, 26, 6, 17, 36] truth=[2, 5, 6, 8, 15, 29] low_truth=[2, 15] overconf=[18, 23]
-[MISS t=740] hits=0 top6=[36, 6, 30, 26, 3, 18] truth=[5, 16, 17, 25, 34, 39] low_truth=[25, 39] overconf=[36, 6]
-[MISS t=741] hits=1 top6=[18, 4, 30, 3, 13, 36] truth=[9, 15, 21, 36, 37, 40] low_truth=[15, 40] overconf=[18, 4]
-[MISS t=742] hits=0 top6=[30, 33, 3, 23, 18, 29] truth=[8, 11, 19, 21, 35, 37] low_truth=[11, 35] overconf=[30, 33]
-[MISS t=743] hits=1 top6=[33, 9, 10, 23, 4, 18] truth=[5, 8, 11, 15, 19, 33] low_truth=[15, 5] overconf=[9, 10]
-[MISS t=744] hits=0 top6=[23, 30, 33, 3, 14, 10] truth=[7, 18, 20, 21, 25, 27] low_truth=[25, 21] overconf=[23, 30]
-[MISS t=745] hits=1 top6=[10, 3, 18, 27, 31, 30] truth=[9, 15, 19, 25, 30, 35] low_truth=[15, 19] overconf=[10, 3]
-[MISS t=746] hits=1 top6=[13, 40, 28, 10, 3, 23] truth=[6, 11, 14, 18, 23, 36] low_truth=[11, 36] overconf=[13, 40]
-[DIAG] Backtest summary: {'mean_nll': 22.153351940804228, 'mean_hits_top6': 0.88, 'n_draws': 150}
-[DIAG] Oracle ablation mean ΔNLL: {'Bayes': 4.316264086481021, 'Markov': 4.290270985572114, 'HMM': 4.2598581193507465, 'LSTM': 4.462272243823332, 'Transformer': 4.11003435891289, 'GNN': 4.461101294521238}
-[PREDICT] Top6: [4, 9, 10, 13, 33, 38] -> written to predicted_tickets.txt
-[RUN] {"type": "predict_log", "ts": "2025-11-20T19:11:35+00:00", "hmmlearn": "0.3.3", "blend_weights": [0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666], "calibration": {"type": "_PostRankIsotonic", "alpha": null, "K": null}, "per_expert_pl_nll": {"Bayes": 21.64022792398224, "Markov": 21.625991922383836, "HMM": 21.739812172559713, "LSTM": 21.73973893564507, "Transformer": 21.977767547862864, "GNN": 21.672218286212594}, "weekday_gate": null, "feedback": {"window": 90, "t_fit": 747, "brier": 0.14315185935965602, "logloss": 0.5757081282262255}}
-[DIAG] Backtest summary: {'type': 'backtest_summary', 'ts': '2025-11-20T19:18:07+00:00', 'n_evals': 150, 'avg_main_pl_nll': 21.739812172559716, 'avg_top6_recall': 0.14555555555555555, 'hit_any_rate': 0.6266666666666667}
-[DIAG] Oracle ablation mean ΔNLL: {'Bayes': 4.409320255382806, 'Markov': 4.408300100418392, 'HMM': 4.407208658449854, 'LSTM': 4.407088120948585, 'Transformer': 4.407079331594411, 'GNN': 4.4069545835777095}
-[RUN] {"type": "predict_log", "ts": "2025-11-20T19:44:32+00:00", "hmmlearn": "0.3.3", "blend_weights": [null], "calibration": {"type": "_PostRankIsotonic", "alpha": null, "K": null, "best_beta": 1.0}, "per_expert_pl_nll": {"Bayes": 21.64022792398224, "Markov": 21.625991922383836, "HMM": 21.739812172559713, "LSTM": 21.739688257152523, "Transformer": 21.52612726287453, "GNN": 21.672218286212594}, "weekday_gate": null, "feedback": {"window": 90, "t_fit": 747, "brier": 0.14315185935965602, "logloss": 0.5757081282262255}}
-[FINAL] Method=HMM+BayesFallback  ticket=(4, 9, 14, 16, 30, 38)  metrics={'avg_hits': 0.0, 'mean_nll': 16.908363512252574}
+[MISS t=634] hits=1 top6=[37, 3, 9, 10, 38, 17] truth=[9, 16, 18, 22, 25, 31] low_truth=[25, 22] overconf=[37, 3]
+[MISS t=635] hits=1 top6=[33, 9, 18, 11, 16, 40] truth=[18, 20, 22, 27, 30, 32] low_truth=[22, 32] overconf=[33, 9]
+[MISS t=636] hits=1 top6=[18, 27, 22, 8, 30, 4] truth=[15, 18, 24, 25, 33, 40] low_truth=[15, 40] overconf=[27, 22]
+[MISS t=638] hits=0 top6=[37, 27, 3, 25, 33, 21] truth=[8, 10, 11, 12, 13, 31] low_truth=[31, 12] overconf=[37, 27]
+[MISS t=641] hits=1 top6=[34, 30, 18, 4, 38, 33] truth=[2, 3, 9, 23, 27, 34] low_truth=[2, 9] overconf=[30, 18]
+[MISS t=643] hits=1 top6=[9, 1, 4, 3, 17, 37] truth=[9, 15, 18, 29, 31, 33] low_truth=[31, 15] overconf=[1, 4]
+[MISS t=644] hits=1 top6=[9, 16, 33, 21, 14, 36] truth=[2, 3, 5, 6, 14, 27] low_truth=[5, 2] overconf=[9, 16]
+[MISS t=645] hits=1 top6=[3, 14, 21, 20, 23, 13] truth=[8, 15, 21, 31, 37, 39] low_truth=[15, 39] overconf=[3, 14]
+[MISS t=646] hits=1 top6=[30, 14, 8, 38, 4, 6] truth=[1, 10, 20, 25, 37, 38] low_truth=[1, 25] overconf=[30, 14]
+[MISS t=647] hits=0 top6=[38, 17, 30, 10, 14, 3] truth=[1, 4, 13, 28, 32, 36] low_truth=[32, 28] overconf=[38, 17]
+[MISS t=648] hits=1 top6=[13, 14, 40, 4, 10, 3] truth=[4, 11, 22, 30, 34, 35] low_truth=[34, 22] overconf=[13, 14]
+[MISS t=649] hits=0 top6=[11, 33, 7, 17, 40, 10] truth=[1, 3, 4, 19, 25, 27] low_truth=[1, 25] overconf=[11, 33]
+[MISS t=652] hits=1 top6=[13, 3, 9, 12, 18, 25] truth=[5, 9, 27, 30, 35, 36] low_truth=[35, 5] overconf=[13, 3]
+[MISS t=653] hits=1 top6=[30, 10, 36, 9, 27, 8] truth=[4, 7, 16, 18, 21, 36] low_truth=[7, 16] overconf=[30, 10]
+[MISS t=654] hits=0 top6=[9, 7, 4, 36, 38, 10] truth=[5, 8, 11, 16, 23, 24] low_truth=[11, 24] overconf=[9, 7]
+[MISS t=655] hits=1 top6=[23, 12, 8, 28, 17, 6] truth=[6, 10, 25, 29, 30, 38] low_truth=[25, 10] overconf=[23, 12]
+[MISS t=656] hits=0 top6=[30, 6, 10, 29, 9, 24] truth=[19, 25, 26, 32, 37, 40] low_truth=[32, 19] overconf=[30, 6]
+[MISS t=657] hits=0 top6=[37, 40, 19, 33, 25, 10] truth=[7, 9, 17, 21, 26, 30] low_truth=[7, 17] overconf=[37, 40]
+[MISS t=658] hits=1 top6=[9, 30, 17, 33, 14, 7] truth=[11, 14, 15, 18, 27, 37] low_truth=[15, 27] overconf=[9, 30]
+[MISS t=660] hits=1 top6=[25, 6, 40, 38, 19, 37] truth=[12, 16, 20, 29, 33, 38] low_truth=[29, 16] overconf=[25, 6]
+[MISS t=662] hits=1 top6=[19, 35, 31, 20, 18, 6] truth=[5, 6, 15, 37, 38, 40] low_truth=[15, 40] overconf=[19, 35]
+[MISS t=663] hits=0 top6=[37, 38, 40, 6, 15, 9] truth=[17, 18, 19, 25, 27, 28] low_truth=[17, 27] overconf=[37, 38]
+[MISS t=665] hits=0 top6=[9, 38, 27, 33, 4, 6] truth=[2, 15, 17, 29, 34, 39] low_truth=[34, 2] overconf=[9, 38]
+[MISS t=667] hits=0 top6=[14, 19, 4, 26, 18, 37] truth=[5, 7, 11, 12, 22, 28] low_truth=[12, 22] overconf=[14, 19]
+[MISS t=668] hits=1 top6=[11, 19, 38, 37, 33, 6] truth=[4, 5, 8, 14, 18, 37] low_truth=[5, 8] overconf=[11, 19]
+[MISS t=669] hits=0 top6=[17, 4, 14, 30, 37, 18] truth=[2, 8, 20, 24, 29, 32] low_truth=[20, 32] overconf=[17, 4]
+[MISS t=670] hits=1 top6=[9, 20, 17, 4, 16, 26] truth=[7, 17, 19, 27, 29, 36] low_truth=[19, 36] overconf=[9, 20]
+[MISS t=671] hits=0 top6=[10, 17, 9, 40, 6, 30] truth=[5, 8, 15, 27, 35, 38] low_truth=[15, 5] overconf=[10, 17]
+[MISS t=672] hits=0 top6=[38, 9, 40, 21, 33, 6] truth=[1, 2, 12, 13, 22, 32] low_truth=[1, 32] overconf=[38, 9]
+[MISS t=674] hits=0 top6=[10, 33, 35, 4, 30, 9] truth=[3, 5, 12, 21, 24, 29] low_truth=[21, 12] overconf=[10, 33]
+[MISS t=675] hits=1 top6=[33, 9, 18, 37, 35, 3] truth=[5, 12, 15, 17, 18, 32] low_truth=[15, 32] overconf=[33, 9]
+[MISS t=677] hits=1 top6=[10, 17, 33, 37, 30, 5] truth=[5, 18, 20, 25, 39, 40] low_truth=[18, 39] overconf=[10, 17]
+[MISS t=678] hits=0 top6=[25, 17, 20, 3, 10, 19] truth=[2, 7, 21, 27, 28, 40] low_truth=[2, 21] overconf=[25, 17]
+[MISS t=680] hits=1 top6=[38, 10, 33, 4, 6, 9] truth=[2, 4, 8, 18, 20, 26] low_truth=[20, 2] overconf=[38, 10]
+[MISS t=681] hits=0 top6=[20, 18, 38, 14, 4, 26] truth=[1, 8, 15, 23, 34, 37] low_truth=[34, 1] overconf=[20, 18]
+[MISS t=682] hits=1 top6=[9, 29, 37, 6, 35, 1] truth=[1, 10, 15, 16, 33, 34] low_truth=[15, 34] overconf=[9, 29]
+[MISS t=683] hits=0 top6=[37, 10, 30, 33, 27, 3] truth=[4, 6, 9, 13, 14, 29] low_truth=[6, 13] overconf=[37, 10]
+[MISS t=685] hits=0 top6=[6, 17, 33, 23, 27, 12] truth=[4, 9, 18, 21, 36, 37] low_truth=[9, 18] overconf=[6, 17]
+[MISS t=686] hits=0 top6=[9, 16, 18, 20, 8, 4] truth=[5, 10, 12, 22, 29, 37] low_truth=[22, 5] overconf=[9, 16]
+[MISS t=687] hits=1 top6=[37, 5, 8, 38, 6, 40] truth=[9, 11, 18, 19, 38, 39] low_truth=[39, 9] overconf=[37, 5]
+[MISS t=688] hits=0 top6=[26, 27, 30, 40, 9, 14] truth=[7, 8, 16, 18, 22, 32] low_truth=[32, 16] overconf=[26, 27]
+[MISS t=690] hits=1 top6=[20, 33, 29, 27, 40, 21] truth=[14, 17, 19, 22, 29, 39] low_truth=[39, 14] overconf=[20, 33]
+[MISS t=691] hits=1 top6=[17, 27, 14, 29, 8, 4] truth=[3, 9, 10, 12, 27, 38] low_truth=[38, 10] overconf=[17, 14]
+[MISS t=692] hits=0 top6=[9, 4, 6, 30, 21, 16] truth=[1, 12, 19, 26, 31, 35] low_truth=[35, 12] overconf=[9, 4]
+[MISS t=693] hits=0 top6=[23, 12, 4, 18, 13, 28] truth=[5, 8, 14, 25, 32, 37] low_truth=[25, 32] overconf=[23, 12]
+[MISS t=694] hits=1 top6=[4, 14, 30, 37, 34, 15] truth=[15, 24, 26, 32, 38, 39] low_truth=[39, 26] overconf=[4, 14]
+[MISS t=695] hits=0 top6=[38, 18, 26, 14, 4, 3] truth=[5, 16, 27, 29, 33, 40] low_truth=[16, 33] overconf=[38, 18]
+[MISS t=696] hits=1 top6=[1, 11, 39, 18, 35, 4] truth=[4, 15, 22, 27, 38, 40] low_truth=[15, 22] overconf=[1, 11]
+[MISS t=697] hits=1 top6=[4, 18, 9, 17, 6, 7] truth=[2, 16, 18, 27, 28, 40] low_truth=[2, 40] overconf=[4, 9]
+[MISS t=699] hits=0 top6=[40, 3, 19, 30, 17, 7] truth=[1, 6, 15, 25, 35, 38] low_truth=[25, 1] overconf=[40, 3]
+[MISS t=700] hits=0 top6=[6, 35, 33, 4, 15, 9] truth=[17, 21, 25, 29, 31, 39] low_truth=[39, 21] overconf=[6, 35]
+[MISS t=702] hits=1 top6=[9, 14, 3, 21, 6, 37] truth=[6, 11, 17, 18, 23, 32] low_truth=[11, 32] overconf=[9, 14]
+[MISS t=704] hits=1 top6=[33, 34, 17, 9, 38, 18] truth=[6, 14, 22, 32, 38, 39] low_truth=[22, 39] overconf=[33, 34]
+[MISS t=705] hits=0 top6=[4, 6, 10, 27, 17, 38] truth=[14, 30, 31, 34, 35, 36] low_truth=[31, 36] overconf=[4, 6]
+[MISS t=706] hits=1 top6=[14, 33, 30, 4, 6, 31] truth=[2, 4, 22, 29, 38, 39] low_truth=[22, 39] overconf=[14, 33]
+[MISS t=707] hits=0 top6=[27, 13, 29, 4, 37, 16] truth=[7, 8, 19, 20, 30, 35] low_truth=[7, 35] overconf=[27, 13]
+[MISS t=709] hits=0 top6=[10, 16, 8, 17, 9, 30] truth=[13, 23, 31, 33, 35, 37] low_truth=[33, 23] overconf=[10, 16]
+[MISS t=710] hits=1 top6=[33, 19, 10, 11, 18, 37] truth=[1, 3, 4, 11, 22, 27] low_truth=[1, 27] overconf=[33, 19]
+[MISS t=712] hits=0 top6=[8, 11, 9, 14, 18, 4] truth=[1, 12, 24, 33, 35, 36] low_truth=[35, 1] overconf=[8, 11]
+[MISS t=713] hits=1 top6=[4, 24, 33, 14, 12, 1] truth=[2, 14, 16, 23, 29, 40] low_truth=[40, 16] overconf=[4, 24]
+[MISS t=715] hits=0 top6=[16, 34, 9, 6, 14, 38] truth=[5, 13, 21, 25, 30, 33] low_truth=[5, 25] overconf=[16, 34]
+[MISS t=716] hits=1 top6=[33, 25, 9, 10, 21, 19] truth=[1, 29, 30, 32, 33, 40] low_truth=[40, 32] overconf=[25, 9]
+[MISS t=717] hits=0 top6=[33, 29, 30, 4, 6, 9] truth=[1, 2, 16, 20, 38, 39] low_truth=[2, 39] overconf=[33, 29]
+[MISS t=718] hits=0 top6=[2, 4, 37, 6, 38, 3] truth=[5, 8, 12, 16, 32, 36] low_truth=[32, 5] overconf=[2, 4]
+[MISS t=721] hits=1 top6=[37, 4, 9, 18, 33, 11] truth=[1, 11, 12, 13, 26, 40] low_truth=[40, 12] overconf=[37, 4]
+[MISS t=722] hits=0 top6=[13, 33, 40, 14, 10, 9] truth=[1, 2, 17, 21, 29, 38] low_truth=[2, 1] overconf=[13, 33]
+[MISS t=723] hits=1 top6=[17, 4, 2, 14, 29, 38] truth=[2, 8, 18, 19, 28, 39] low_truth=[39, 18] overconf=[17, 4]
+[MISS t=724] hits=0 top6=[6, 30, 2, 8, 27, 18] truth=[3, 12, 14, 26, 33, 34] low_truth=[12, 26] overconf=[6, 30]
+[MISS t=725] hits=0 top6=[14, 9, 30, 29, 38, 33] truth=[4, 5, 10, 24, 27, 37] low_truth=[5, 27] overconf=[14, 9]
+[MISS t=726] hits=1 top6=[4, 29, 37, 32, 18, 27] truth=[13, 15, 21, 34, 35, 37] low_truth=[34, 15] overconf=[4, 29]
+[MISS t=727] hits=1 top6=[37, 35, 33, 40, 27, 20] truth=[8, 10, 12, 28, 34, 37] low_truth=[34, 8] overconf=[35, 33]
+[MISS t=728] hits=0 top6=[8, 10, 18, 9, 37, 33] truth=[7, 15, 17, 28, 30, 31] low_truth=[15, 7] overconf=[8, 10]
+[MISS t=729] hits=1 top6=[38, 28, 15, 9, 33, 30] truth=[5, 7, 16, 29, 33, 34] low_truth=[5, 16] overconf=[38, 28]
+[MISS t=731] hits=1 top6=[7, 10, 14, 4, 21, 37] truth=[2, 5, 8, 14, 29, 40] low_truth=[2, 29] overconf=[7, 10]
+[MISS t=732] hits=1 top6=[8, 2, 29, 14, 4, 5] truth=[5, 7, 9, 19, 20, 39] low_truth=[20, 7] overconf=[8, 2]
+[MISS t=733] hits=1 top6=[5, 7, 35, 17, 29, 38] truth=[2, 7, 10, 14, 15, 21] low_truth=[2, 21] overconf=[5, 35]
+[MISS t=734] hits=1 top6=[15, 18, 2, 21, 30, 14] truth=[4, 15, 16, 22, 29, 31] low_truth=[31, 22] overconf=[18, 2]
+[MISS t=735] hits=0 top6=[4, 29, 30, 14, 17, 26] truth=[2, 10, 19, 25, 28, 35] low_truth=[19, 25] overconf=[4, 29]
+[MISS t=736] hits=0 top6=[19, 4, 37, 2, 13, 10] truth=[1, 5, 11, 14, 28, 32] low_truth=[32, 5] overconf=[19, 4]
+[MISS t=737] hits=1 top6=[14, 5, 30, 37, 11, 29] truth=[5, 19, 20, 25, 38, 39] low_truth=[25, 20] overconf=[14, 30]
+[MISS t=738] hits=0 top6=[5, 19, 17, 29, 3, 9] truth=[7, 12, 22, 32, 35, 38] low_truth=[22, 32] overconf=[5, 19]
+[MISS t=741] hits=1 top6=[16, 5, 9, 8, 33, 10] truth=[9, 15, 21, 36, 37, 40] low_truth=[36, 40] overconf=[16, 5]
+[MISS t=742] hits=1 top6=[37, 9, 40, 30, 10, 4] truth=[8, 11, 19, 21, 35, 37] low_truth=[11, 19] overconf=[9, 40]
+[MISS t=743] hits=1 top6=[9, 37, 21, 40, 10, 19] truth=[5, 8, 11, 15, 19, 33] low_truth=[11, 15] overconf=[9, 37]
+[MISS t=744] hits=0 top6=[33, 19, 17, 4, 30, 8] truth=[7, 18, 20, 21, 25, 27] low_truth=[7, 20] overconf=[33, 19]
+[DIAG] Backtest summary: {'mean_nll': 22.156006272273878, 'mean_hits_top6': 0.9466666666666667, 'n_draws': 150}
+[DIAG] Oracle ablation mean ΔNLL: {'Bayes': 6.13706182384704, 'Markov': 6.119636510836477, 'HMM': 6.148452612043709, 'LSTM': 6.216833589783946, 'Transformer': 5.837618460355128, 'GNN': 6.22142267786614}
+[PREDICT] Top6: [3, 4, 9, 10, 33, 38] -> written to predicted_tickets.txt
+[RUN] {"type": "predict_log", "ts": "2025-11-21T18:37:25+00:00", "hmmlearn": "0.3.3", "blend_weights": [0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666, 0.16666666666666666], "calibration": {"type": "_PostRankIsotonic", "alpha": null, "K": null}, "per_expert_pl_nll": {"Bayes": 21.64022792398224, "Markov": 21.625991922383836, "HMM": 22.182340780666433, "LSTM": 21.740533211085804, "Transformer": 22.4792121647492, "GNN": 21.890810434878208}, "weekday_gate": null, "feedback": {"window": 90, "t_fit": 747, "brier": 0.1431620835550978, "logloss": 0.5758997504126504}}
+[DIAG] Backtest summary: {'type': 'backtest_summary', 'ts': '2025-11-21T18:45:02+00:00', 'n_evals': 150, 'avg_main_pl_nll': 21.739812172559716, 'avg_top6_recall': 0.14555555555555555, 'hit_any_rate': 0.6266666666666667}
+[DIAG] Oracle ablation mean ΔNLL: {'Bayes': 4.420402288382443, 'Markov': 4.41933365400532, 'HMM': 4.4247663499522005, 'LSTM': 4.417719562884088, 'Transformer': 4.420979317446314, 'GNN': 4.418231302057326}
+[RUN] {"type": "predict_log", "ts": "2025-11-21T19:30:52+00:00", "hmmlearn": "0.3.3", "blend_weights": [null], "calibration": {"type": "_PostRankIsotonic", "alpha": null, "K": null, "best_beta": 1.0}, "per_expert_pl_nll": {"Bayes": 21.64022792398224, "Markov": 21.625991922383836, "HMM": 21.872026296986327, "LSTM": 21.740450204179883, "Transformer": 21.651283084203616, "GNN": 21.890810434878208}, "weekday_gate": null, "feedback": {"window": 90, "t_fit": 747, "brier": 0.1431620835550978, "logloss": 0.5758997504126504}}
+[FINAL] Method=Bayes  ticket=(4, 9, 14, 16, 30, 38)  metrics={'avg_hits': 0.0, 'mean_nll': 16.981015293797626}
