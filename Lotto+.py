@@ -2247,11 +2247,13 @@ try:
 
         # Keras compile patch: enable set-aware loss & add Top-6 metrics automatically (opt-in)
         _KERAS_COMPILE_ORIG = _keras.Model.compile
+        _compile_log_count = [0]  # Mutable counter to limit verbosity
 
         def _keras_compile_patched(self, *args, **kwargs):
             try:
                 use_set_loss = str(_os_train.getenv("LOTTO_SET_LOSS", "1")).strip() in {"1", "true", "yes", "on"}
                 add_metrics = str(_os_train.getenv("LOTTO_ADD_SET_METRICS", "1")).strip() in {"1", "true", "yes", "on"}
+                verbose_compile_log = str(_os_train.getenv("LOTTO_VERBOSE_COMPILE", "0")).strip() in {"1", "true", "yes", "on"}
 
                 if use_set_loss:
                     # Replace/augment the provided loss with our set-aware objective.
@@ -2272,7 +2274,8 @@ try:
                     if "recall_at_6" not in existing: mets.append(recall_at_6)
                     kwargs["metrics"] = mets
 
-                if use_set_loss or add_metrics:
+                # Only log first compile call unless verbose mode enabled
+                if (use_set_loss or add_metrics) and (_compile_log_count[0] == 0 or verbose_compile_log):
                     print("[TRAIN] keras.Model.compile patched:",
                           json.dumps({
                               "set_loss": bool(use_set_loss),
@@ -2282,6 +2285,7 @@ try:
                               "pair_neg": _env_int("LOTTO_LOSS_PAIR_NEG", 20),
                               "add_metrics": bool(add_metrics)
                           }))
+                    _compile_log_count[0] += 1
             except Exception:
                 pass
             return _KERAS_COMPILE_ORIG(self, *args, **kwargs)
