@@ -104,6 +104,9 @@ PF_ENSEMBLE_CONFIGS = [      # (num_particles, alpha, sigma)
     (12000, 0.004, 0.008),
     (16000, 0.003, 0.006),
     (8000,  0.006, 0.012),
+    (10000, 0.005, 0.010),
+    (14000, 0.0035, 0.007),
+    (20000, 0.0025, 0.005),
 ]
 
 _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": None}
@@ -1145,13 +1148,13 @@ class _MetaStacker:
                 self.feature_dim_ = int(X.shape[1]) if (X.ndim == 2) else 5
                 return self
             clf = MLPClassifier(
-                hidden_layer_sizes=(128, 64, 32,),
+                hidden_layer_sizes=(256, 128, 64, 32,),
                 activation="relu",
-                alpha=1e-4,
-                learning_rate_init=1e-3,
-                max_iter=2000,
+                alpha=5e-5,
+                learning_rate_init=8e-4,
+                max_iter=3000,
                 early_stopping=True,
-                n_iter_no_change=25,
+                n_iter_no_change=30,
                 random_state=42,
                 verbose=False
             )
@@ -3735,6 +3738,70 @@ def compute_stat_features(draw_window, idx_offset):
         else:
             sum_compatibility = 0.5
 
+        # ========== PHASE 2: ADVANCED PATTERN FEATURES ==========
+
+        # 9. Decade distribution features (track density in each decade)
+        # Decades: [1-10], [11-20], [21-30], [31-40]
+        last_5_draws = draw_window[-min(5, len(draw_window)):] if draw_window else []
+        decade_counts = [0, 0, 0, 0]
+        for d in last_5_draws:
+            for n in d:
+                decade_idx = min(3, (n - 1) // 10)
+                decade_counts[decade_idx] += 1
+        total_nums = max(1, sum(decade_counts))
+        decade_pressure = [c / total_nums for c in decade_counts]
+        cand_decade = min(3, (cand_num - 1) // 10)
+        cand_decade_pressure = decade_pressure[cand_decade]
+
+        # 10. Advanced odd/even balance (deviation from ideal 3-3 split)
+        odd_even_balance = 0.5
+        if last_in_window:
+            odd_count_last = sum(1 for n in last_in_window if n % 2 == 1)
+            # Ideal is 3 odd, 3 even; measure deviation
+            ideal_odd = 3.0
+            balance_deviation = abs(odd_count_last - ideal_odd) / 3.0
+            odd_even_balance = max(0.0, 1.0 - balance_deviation)
+
+        # 11. Prime number indicator
+        primes = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}
+        is_prime = 1.0 if cand_num in primes else 0.0
+        prime_count_last = sum(1 for n in last_in_window if n in primes) if last_in_window else 0
+        prime_ratio_last = prime_count_last / max(1, len(last_in_window))
+
+        # 12. Digit sum features (single digit sum, e.g., 37 -> 3+7=10 -> 1+0=1)
+        digit_sum = sum(int(d) for d in str(cand_num))
+        while digit_sum >= 10:
+            digit_sum = sum(int(d) for d in str(digit_sum))
+        digit_sum_norm = digit_sum / 9.0  # Normalize to [0, 1]
+
+        # 13. Advanced gap analysis (gap acceleration - is gap growing or shrinking?)
+        gap_acceleration = 0.0
+        if idx_offset >= 15:
+            appearances = [t for t in range(max(0, idx_offset-14), idx_offset+1) if cand_num in draws[t]]
+            if len(appearances) >= 3:
+                gaps_recent = [appearances[j+1] - appearances[j] for j in range(len(appearances)-2, len(appearances)-1)]
+                gaps_prev = [appearances[j+1] - appearances[j] for j in range(len(appearances)-3, len(appearances)-2)]
+                if gaps_recent and gaps_prev:
+                    gap_acceleration = (np.mean(gaps_recent) - np.mean(gaps_prev)) / 10.0  # Normalized
+
+        # 14. Hot/cold streak indicator (hot if appeared in 3+ of last 5, cold if 0 of last 5)
+        hot_cold_indicator = 0.0
+        if idx_offset >= 5:
+            recent_5_draws = draws[max(0, idx_offset-4):idx_offset+1]
+            appearances_in_5 = sum(1 for d in recent_5_draws if cand_num in d)
+            if appearances_in_5 >= 3:
+                hot_cold_indicator = 1.0  # Hot
+            elif appearances_in_5== 0:
+                hot_cold_indicator = -1.0  # Cold
+
+        # 15. Mirror number feature (40-n+1, e.g., mirror of 5 is 36)
+        mirror_num = 41 - cand_num
+        mirror_in_last = 1.0 if (last_in_window and mirror_num in last_in_window) else 0.0
+        mirror_freq_recent = 0.0
+        if idx_offset >= 10:
+            recent_10 = draws[max(0, idx_offset-9):idx_offset+1]
+            mirror_freq_recent = sum(1 for d in recent_10 if mirror_num in d) / len(recent_10)
+
         feats += [
             nearest_dist_norm[i],      # distance to nearest num in last draw (norm)
             contain_gap_norm[i],       # size of containing gap (norm)
@@ -3752,7 +3819,17 @@ def compute_stat_features(draw_window, idx_offset):
             q1_pressure, q2_pressure, q3_pressure, q4_pressure,  # Quadrant pressures
             cand_quadrant_pressure,                      # Candidate's quadrant pressure
             cycle_strength,                              # Regular cycle indicator
-            sum_compatibility                            # Sum range compatibility
+            sum_compatibility,                           # Sum range compatibility
+            # NEW PHASE 2 ADVANCED PATTERN FEATURES:
+            cand_decade_pressure,                        # Decade pressure for candidate
+            odd_even_balance,                            # Odd/even balance quality
+            is_prime,                                    # Is candidate a prime number
+            prime_ratio_last,                            # Prime ratio in last draw
+            digit_sum_norm,                              # Digit sum (numerology)
+            gap_acceleration,                            # Gap trend (accelerating/decelerating)
+            hot_cold_indicator,                          # Hot/cold streak indicator
+            mirror_in_last,                              # Mirror number in last draw
+            mirror_freq_recent                           # Mirror number frequency (recent)
         ] + comm_onehot
         features.append(feats)
     return np.array(features)  # shape (40, n_features)
@@ -4961,7 +5038,7 @@ def setar_max_logprob_of_set(model, ticket, K=24, rng_seed=13):
 
 # --- SetAR core components: training and beam search ---------------------------------
 
-def train_setar_model(draws_hist, epochs=16, K=6, verbose=0, d_model=64, seed=1337):
+def train_setar_model(draws_hist, epochs=150, K=6, verbose=0, d_model=128, seed=1337):
     """
     Train a lightweight autoregressive set model (SetAR) that predicts the next
     element given previously selected elements. We treat each historical 6-number
@@ -5742,6 +5819,9 @@ PF_ENSEMBLE_CONFIGS = [      # (num_particles, alpha, sigma)
     (12000, 0.004, 0.008),
     (16000, 0.003, 0.006),
     (8000,  0.006, 0.012),
+    (10000, 0.005, 0.010),
+    (14000, 0.0035, 0.007),
+    (20000, 0.0025, 0.005),
 ]
 
 _cal_cache = {"LSTM": None, "Transformer": None, "t_fit": None}
