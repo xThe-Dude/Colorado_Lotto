@@ -3613,6 +3613,7 @@ def compute_stat_features(draw_window, idx_offset):
     # Guard: idx_offset must be < CURRENT_TARGET_IDX (no peeking at the target draw)
     _assert_idx_ok(idx_offset, context="compute_stat_features(idx_offset)")
     n_numbers = 40
+    k = len(draw_window)  # Determine window size from draw_window length
     features = []
     # Flatten draws in window for frequency
     all_nums_window = [num for d in draw_window for num in d]
