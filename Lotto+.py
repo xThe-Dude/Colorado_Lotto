@@ -1046,6 +1046,14 @@ CONFIDENCE_MC_PASSES = 30      # Number of MC Dropout passes for uncertainty est
 CONFIDENCE_QUANTILE = 0.70     # Confidence threshold quantile (0.70 = use top 30% most confident)
 CONFIDENCE_MIN_EXPERTS = 1     # Minimum experts required (fallback to LSTM if less)
 
+# --- Phase 4 Specialized Training Parameters (Upgrade 2) ---
+# NOTE: Multi-task training is implemented but requires auxiliary target preparation.
+# Setting to False maintains backward compatibility. Enable after preparing aux targets.
+USE_SPECIALIZED_TRAINING = False  # Enable multi-task learning with specialized objectives
+TCNN_AUX_WEIGHT = 0.15           # TCN: Frequency change prediction weight (0.85 main + 0.15 aux)
+TRANSFORMER_AUX_WEIGHT = 0.20    # Transformer: Future draw prediction weight (0.80 main + 0.20 aux)
+GNN_AUX_WEIGHT = 0.15            # GNN: Co-occurrence prediction weight (0.85 main + 0.15 aux)
+
 # --- New global knobs for prior strength and sharpening ---
 PF_PRIOR_BLEND = 0.08          # 0.05–0.10 so stacker signal dominates
 ADAPTIVE_TEMPERATURE = 1.0     # keep at 1.0 until calibrators are confirmed OK
@@ -4612,10 +4620,16 @@ def bt_pairwise_loss_factory(num_neg=20):
         return tf.reduce_mean(per_ex)
     return _loss
 
-def build_tcnn_model(input_shape, output_dim, meta_dim=3, final_dropout=0.35):
+def build_tcnn_model(input_shape, output_dim, meta_dim=3, final_dropout=0.35, use_aux_task=None):
     """
     DeepSets-style set encoder with a tiny meta-feature head (weekday, entropy, dispersion).
+
+    Phase 4 Upgrade 2: Added auxiliary task for temporal trend decomposition.
+    Auxiliary task: Predict frequency change trends (how number frequencies are shifting).
     """
+    if use_aux_task is None:
+        use_aux_task = USE_SPECIALIZED_TRAINING
+
     inputs = layers.Input(shape=input_shape, name="set_inputs")        # (40, n_features)
     meta_in = layers.Input(shape=(meta_dim,), name="meta_inputs")      # (3,)
 
@@ -4634,29 +4648,57 @@ def build_tcnn_model(input_shape, output_dim, meta_dim=3, final_dropout=0.35):
     # Broadcast back to elements
     timesteps = input_shape[0] if (input_shape and input_shape[0] is not None) else 40
     g_rep = layers.RepeatVector(timesteps)(g)
-    x = layers.Concatenate(axis=-1)([x, g_rep])
+    x_combined = layers.Concatenate(axis=-1)([x, g_rep])
 
     # ρ: element-wise scoring MLP (stronger dropout late)
-    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dense(64, activation='relu')(x_combined)
     x = layers.Dense(64, activation='relu')(x)
     x = layers.Dense(32, activation='relu')(x)
     x = layers.Dropout(final_dropout)(x)
 
+    # Main output: logits for each number
     logits = layers.Conv1D(1, kernel_size=1)(x)           # (batch, 40, 1)
-    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)
+    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1), name='main_logits')(logits)
 
-    model = keras.Model(inputs=[inputs, meta_in], outputs=logits)
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
-        loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
-    )
+    # Phase 4 Upgrade 2: Auxiliary task - Frequency change prediction
+    if use_aux_task:
+        # Predict frequency change trends (40 values: -1 to +1 for each number)
+        # This helps the model learn temporal dynamics
+        freq_change = layers.Dense(32, activation='relu')(g)
+        freq_change = layers.Dense(40, activation='tanh', name='freq_change')(freq_change)  # (batch, 40)
+
+        model = keras.Model(inputs=[inputs, meta_in], outputs=[logits, freq_change])
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+            loss={
+                'main_logits': pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+                'freq_change': 'mse'  # Mean squared error for frequency change prediction
+            },
+            loss_weights={
+                'main_logits': 1.0 - TCNN_AUX_WEIGHT,
+                'freq_change': TCNN_AUX_WEIGHT
+            }
+        )
+    else:
+        model = keras.Model(inputs=[inputs, meta_in], outputs=logits)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+            loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+        )
+
     return model
 
 # --- 3.3. Transformer Model Implementation ---
-def build_transformer_model(input_shape, output_dim, num_heads=4, ff_dim=96, meta_dim=3, final_dropout=0.35):
+def build_transformer_model(input_shape, output_dim, num_heads=4, ff_dim=96, meta_dim=3, final_dropout=0.35, use_aux_task=None):
     """
     Set Transformer style with a tiny meta-feature head; logits shape [batch, 40].
+
+    Phase 4 Upgrade 2: Added auxiliary task for long-range pattern prediction.
+    Auxiliary task: Predict future draw patterns (anticipate draws 2-3 steps ahead).
     """
+    if use_aux_task is None:
+        use_aux_task = USE_SPECIALIZED_TRAINING
+
     inputs = layers.Input(shape=input_shape, name="set_inputs")    # (40, n_features)
     meta_in = layers.Input(shape=(meta_dim,), name="meta_inputs")  # (3,)
     x = inputs
@@ -4684,21 +4726,43 @@ def build_transformer_model(input_shape, output_dim, num_heads=4, ff_dim=96, met
     m = layers.Dense(16, activation='relu')(meta_in)
     m = layers.Dense(16, activation='relu')(m)
     g = layers.Concatenate()([g, m])
-    g = layers.Dense(64, activation='relu')(g)
+    g_shared = layers.Dense(64, activation='relu')(g)
     timesteps = input_shape[0] if (input_shape and input_shape[0] is not None) else 40
-    g_rep = layers.RepeatVector(timesteps)(g)
-    y = layers.Concatenate(axis=-1)([y, g_rep])
+    g_rep = layers.RepeatVector(timesteps)(g_shared)
+    y_combined = layers.Concatenate(axis=-1)([y, g_rep])
 
     # Per-element projection (stronger final dropout)
-    y = layers.Dropout(final_dropout)(y)
+    y = layers.Dropout(final_dropout)(y_combined)
     logits = layers.Conv1D(1, kernel_size=1)(y)
-    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)
+    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1), name='main_logits')(logits)
 
-    model = keras.Model(inputs=[inputs, meta_in], outputs=logits)
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
-        loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
-    )
+    # Phase 4 Upgrade 2: Auxiliary task - Long-range pattern prediction
+    if use_aux_task:
+        # Predict future draw characteristics (helps learn long-range dependencies)
+        # Output: 40 values representing likelihood of numbers appearing in future draws
+        future_pattern = layers.Dense(64, activation='relu')(g_shared)
+        future_pattern = layers.Dropout(0.3)(future_pattern)
+        future_pattern = layers.Dense(40, activation='sigmoid', name='future_pattern')(future_pattern)  # (batch, 40)
+
+        model = keras.Model(inputs=[inputs, meta_in], outputs=[logits, future_pattern])
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+            loss={
+                'main_logits': pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+                'future_pattern': 'binary_crossentropy'  # Binary cross-entropy for future pattern prediction
+            },
+            loss_weights={
+                'main_logits': 1.0 - TRANSFORMER_AUX_WEIGHT,
+                'future_pattern': TRANSFORMER_AUX_WEIGHT
+            }
+        )
+    else:
+        model = keras.Model(inputs=[inputs, meta_in], outputs=logits)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+            loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+        )
+
     return model
 
 
@@ -4853,7 +4917,7 @@ class GraphConvLayer(layers.Layer):
 
 
 def build_gnn_model(num_nodes=40, node_feature_dim=5, meta_dim=3,
-                    hidden_dims=[64, 64, 32], final_dropout=0.35):
+                    hidden_dims=[64, 64, 32], final_dropout=0.35, use_aux_task=None):
     """
     Build a Graph Neural Network for lottery prediction.
 
@@ -4863,10 +4927,17 @@ def build_gnn_model(num_nodes=40, node_feature_dim=5, meta_dim=3,
         meta_dim: Dimension of meta features (weekday, entropy, dispersion)
         hidden_dims: List of hidden layer dimensions
         final_dropout: Dropout rate before output layer
+        use_aux_task: Enable auxiliary co-occurrence prediction task
+
+    Phase 4 Upgrade 2: Added auxiliary task for co-occurrence prediction.
+    Auxiliary task: Predict pairwise co-occurrence strengths (which numbers tend to appear together).
 
     Returns:
         Compiled Keras model
     """
+    if use_aux_task is None:
+        use_aux_task = USE_SPECIALIZED_TRAINING
+
     # Inputs
     node_features = layers.Input(shape=(num_nodes, node_feature_dim), name="node_features")
     adj_matrix = layers.Input(shape=(num_nodes, num_nodes), name="adj_matrix")
@@ -4887,35 +4958,62 @@ def build_gnn_model(num_nodes=40, node_feature_dim=5, meta_dim=3,
 
     # Combine graph representation with meta features
     g = layers.Concatenate()([g, m])
-    g = layers.Dense(64, activation='relu')(g)
+    g_shared = layers.Dense(64, activation='relu')(g)
 
     # Broadcast back to node level
-    g_rep = layers.RepeatVector(num_nodes)(g)  # (batch, 40, 64)
+    g_rep = layers.RepeatVector(num_nodes)(g_shared)  # (batch, 40, 64)
 
     # Combine with node-level features
-    x = layers.Concatenate(axis=-1)([x, g_rep])  # (batch, 40, hidden_dim + 64)
+    x_combined = layers.Concatenate(axis=-1)([x, g_rep])  # (batch, 40, hidden_dim + 64)
 
     # Final MLP for per-node prediction
-    x = layers.Dense(64, activation='relu')(x)
+    x = layers.Dense(64, activation='relu')(x_combined)
     x = layers.Dense(32, activation='relu')(x)
     x = layers.Dropout(final_dropout)(x)
 
     # Output logits for each node (number)
     logits = layers.Conv1D(1, kernel_size=1)(x)  # (batch, 40, 1)
-    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1))(logits)  # (batch, 40)
+    logits = layers.Lambda(lambda t: tf.squeeze(t, axis=-1), name='main_logits')(logits)  # (batch, 40)
 
-    # Build model
-    model = keras.Model(
-        inputs=[node_features, adj_matrix, meta_in],
-        outputs=logits,
-        name="GNN_Lottery_Predictor"
-    )
+    # Phase 4 Upgrade 2: Auxiliary task - Co-occurrence community prediction
+    if use_aux_task:
+        # Predict which numbers form strong co-occurrence communities
+        # Output: 40 values representing community membership strength
+        cooc_community = layers.Dense(32, activation='relu')(g_shared)
+        cooc_community = layers.Dense(40, activation='sigmoid', name='cooc_community')(cooc_community)  # (batch, 40)
 
-    # Compile with same loss as other models
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=3e-4),
-        loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
-    )
+        # Build model with dual outputs
+        model = keras.Model(
+            inputs=[node_features, adj_matrix, meta_in],
+            outputs=[logits, cooc_community],
+            name="GNN_Lottery_Predictor_MultiTask"
+        )
+
+        # Compile with multi-task loss
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+            loss={
+                'main_logits': pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+                'cooc_community': 'binary_crossentropy'  # Community membership prediction
+            },
+            loss_weights={
+                'main_logits': 1.0 - GNN_AUX_WEIGHT,
+                'cooc_community': GNN_AUX_WEIGHT
+            }
+        )
+    else:
+        # Build model with single output (backward compatible)
+        model = keras.Model(
+            inputs=[node_features, adj_matrix, meta_in],
+            outputs=logits,
+            name="GNN_Lottery_Predictor"
+        )
+
+        # Compile with same loss as other models
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=3e-4),
+            loss=pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10),
+        )
 
     return model
 
@@ -4957,8 +5055,16 @@ def _gnn_prob_from_history(hist_draws, gnn_model=None, meta_features=None):
             if meta_features.ndim == 1:
                 meta_features = np_.expand_dims(meta_features, axis=0)
 
-        # Predict
-        logits = gnn_model.predict([node_batch, adj_batch, meta_features], verbose=0)
+        # Predict (handle multi-task outputs from Phase 4 Upgrade 2)
+        outputs = gnn_model.predict([node_batch, adj_batch, meta_features], verbose=0)
+
+        # Phase 4: Multi-task models return [main_logits, aux_output]
+        # Extract only the main logits (first output)
+        if isinstance(outputs, (list, tuple)):
+            logits = outputs[0]  # Main task output
+        else:
+            logits = outputs  # Single-task model (backward compatible)
+
         logits = logits.reshape(-1)  # (40,)
 
         # Convert logits to probabilities
