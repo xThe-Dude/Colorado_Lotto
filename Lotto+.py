@@ -3363,8 +3363,10 @@ try:
                 if use_set_loss:
                     # Replace/augment the provided loss with our set-aware objective.
                     # Works for a single-output model producing 40 probabilities.
+                    # Don't override if multi-task loss is already configured (dict or loss_weights present)
                     kwargs = dict(kwargs)
-                    kwargs["loss"] = build_set_aware_loss()
+                    if not isinstance(kwargs.get("loss"), dict) and "loss_weights" not in kwargs:
+                        kwargs["loss"] = build_set_aware_loss()
 
                 if add_metrics:
                     mets = list(kwargs.get("metrics", []) or [])
