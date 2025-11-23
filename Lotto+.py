@@ -1047,9 +1047,10 @@ CONFIDENCE_QUANTILE = 0.70     # Confidence threshold quantile (0.70 = use top 3
 CONFIDENCE_MIN_EXPERTS = 1     # Minimum experts required (fallback to LSTM if less)
 
 # --- Phase 4 Specialized Training Parameters (Upgrade 2) ---
-# NOTE: Multi-task training is implemented but requires auxiliary target preparation.
-# Setting to False maintains backward compatibility. Enable after preparing aux targets.
-USE_SPECIALIZED_TRAINING = False  # Enable multi-task learning with specialized objectives
+# NOTE: Multi-task training with auxiliary targets now fully implemented and enabled.
+# TCN learns frequency change trends, Transformer learns future patterns,
+# GNN learns co-occurrence communities for improved ensemble diversity.
+USE_SPECIALIZED_TRAINING = True  # Enable multi-task learning with specialized objectives
 TCNN_AUX_WEIGHT = 0.15           # TCN: Frequency change prediction weight (0.85 main + 0.15 aux)
 TRANSFORMER_AUX_WEIGHT = 0.20    # Transformer: Future draw prediction weight (0.80 main + 0.20 aux)
 GNN_AUX_WEIGHT = 0.15            # GNN: Co-occurrence prediction weight (0.85 main + 0.15 aux)
@@ -4491,6 +4492,139 @@ y_seq = np.array(y_seq)  # shape (samples, 40)
 # Clear guard now that the bulk feature construction is complete
 _set_target_idx(None)
 
+# --- Auxiliary Target Preparation for Multi-Task Learning (Phase 4 Upgrade 2) ---
+def prepare_tcn_aux_targets(draws_data, indices, window=10):
+    """
+    Prepare auxiliary targets for TCN: Frequency change trends.
+
+    For each sample at index idx, compute how number frequencies are changing
+    over time by comparing recent vs older frequency distributions.
+
+    Args:
+        draws_data: List of draw sets (each draw is a set of 6 numbers from 1-40)
+        indices: List of indices corresponding to each sample in X_seq
+        window: Number of draws to use for frequency comparison
+
+    Returns:
+        np.array of shape (len(indices), 40) with values in [-1, 1]
+        representing frequency change trends for each number
+    """
+    aux_targets = []
+
+    for idx in indices:
+        if idx < window * 2:
+            # Not enough history for comparison, use zeros
+            aux_targets.append(np.zeros(40))
+        else:
+            # Compute recent frequency (last window draws before idx)
+            recent_draws = draws_data[idx - window:idx]
+            recent_counts = np.zeros(40)
+            for draw in recent_draws:
+                for num in draw:
+                    recent_counts[num - 1] += 1
+            recent_freq = recent_counts / window
+
+            # Compute older frequency (window draws before that)
+            older_draws = draws_data[idx - 2*window:idx - window]
+            older_counts = np.zeros(40)
+            for draw in older_draws:
+                for num in draw:
+                    older_counts[num - 1] += 1
+            older_freq = older_counts / window
+
+            # Compute frequency change (normalized)
+            freq_change = (recent_freq - older_freq) / (older_freq + 1e-6)
+            # Clip to [-1, 1] range using tanh-like normalization
+            freq_change = np.clip(freq_change, -1, 1)
+
+            aux_targets.append(freq_change)
+
+    return np.array(aux_targets)
+
+
+def prepare_transformer_aux_targets(draws_data, indices, lookahead=2):
+    """
+    Prepare auxiliary targets for Transformer: Future pattern prediction.
+
+    For each sample at index idx, create a binary indicator of which numbers
+    appear in future draws (at idx+lookahead).
+
+    Args:
+        draws_data: List of draw sets
+        indices: List of indices corresponding to each sample in X_seq
+        lookahead: How many steps ahead to predict (default: 2)
+
+    Returns:
+        np.array of shape (len(indices), 40) with binary values
+        indicating which numbers appear in future draws
+    """
+    aux_targets = []
+    n_draws = len(draws_data)
+
+    for idx in indices:
+        future_idx = idx + lookahead
+        if future_idx >= n_draws:
+            # No future draw available, use zeros
+            aux_targets.append(np.zeros(40))
+        else:
+            # Binary indicator for future draw
+            future_draw = draws_data[future_idx]
+            future_pattern = np.array([1 if num in future_draw else 0 for num in range(1, 41)])
+            aux_targets.append(future_pattern)
+
+    return np.array(aux_targets)
+
+
+def prepare_gnn_aux_targets(draws_data, indices, window=30, top_k=20):
+    """
+    Prepare auxiliary targets for GNN: Co-occurrence community membership.
+
+    For each sample, identify which numbers belong to strong co-occurrence
+    communities based on historical patterns.
+
+    Args:
+        draws_data: List of draw sets
+        indices: List of indices corresponding to each sample
+        window: Number of recent draws to analyze for co-occurrence
+        top_k: Number of top co-occurring pairs to consider for communities
+
+    Returns:
+        np.array of shape (len(indices), 40) with values in [0, 1]
+        representing community membership strength
+    """
+    aux_targets = []
+
+    for idx in indices:
+        if idx < window:
+            # Not enough history, use uniform
+            aux_targets.append(np.ones(40) * 0.5)
+        else:
+            # Analyze recent draws for co-occurrence
+            recent_draws = draws_data[max(0, idx - window):idx]
+
+            # Build co-occurrence matrix
+            cooc_matrix = np.zeros((40, 40))
+            for draw in recent_draws:
+                nums = list(draw)
+                for i, n1 in enumerate(nums):
+                    for n2 in nums[i+1:]:
+                        cooc_matrix[n1-1, n2-1] += 1
+                        cooc_matrix[n2-1, n1-1] += 1
+
+            # Compute community strength for each number
+            # Use row-wise sum as a proxy for community centrality
+            community_strength = np.sum(cooc_matrix, axis=1)
+
+            # Normalize to [0, 1]
+            if community_strength.max() > 0:
+                community_strength = community_strength / community_strength.max()
+            else:
+                community_strength = np.ones(40) * 0.5
+
+            aux_targets.append(community_strength)
+
+    return np.array(aux_targets)
+
 # --- Set-aware learning-to-rank losses (PL/BT) -------------------------------------------
 import tensorflow as tf
 import keras  # Keras 3.x API
@@ -6181,28 +6315,75 @@ X_train_dl, X_val_dl = X_seq[:split_idx], X_seq[split_idx:]
 M_train_dl, M_val_dl = M_seq[:split_idx], M_seq[split_idx:]
 y_train_dl, y_val_dl = y_seq[:split_idx], y_seq[split_idx:]
 
+# --- Prepare auxiliary targets for multi-task learning (Phase 4 Upgrade 2) ---
+if USE_SPECIALIZED_TRAINING:
+    print("Preparing auxiliary targets for multi-task training...")
+    # Generate indices for each sample (k to n_draws-1)
+    train_indices = list(range(k, k + split_idx))
+    val_indices = list(range(k + split_idx, n_draws - 1))
+
+    # TCN auxiliary targets: Frequency change trends
+    tcn_aux_train = prepare_tcn_aux_targets(draws, train_indices, window=10)
+    tcn_aux_val = prepare_tcn_aux_targets(draws, val_indices, window=10)
+
+    # Transformer auxiliary targets: Future pattern prediction
+    transformer_aux_train = prepare_transformer_aux_targets(draws, train_indices, lookahead=2)
+    transformer_aux_val = prepare_transformer_aux_targets(draws, val_indices, lookahead=2)
+
+    print(f"  TCN aux targets: train {tcn_aux_train.shape}, val {tcn_aux_val.shape}")
+    print(f"  Transformer aux targets: train {transformer_aux_train.shape}, val {transformer_aux_val.shape}")
+else:
+    tcn_aux_train = tcn_aux_val = None
+    transformer_aux_train = transformer_aux_val = None
+
 print("Training Temporal CNN model...")
 lstm_model = build_tcnn_model(input_shape=X_train_dl.shape[1:], output_dim=40, meta_dim=M_train_dl.shape[1], final_dropout=0.35)
-lstm_model.fit(
-    [X_train_dl, M_train_dl], y_train_dl,
-    validation_data=([X_val_dl, M_val_dl], y_val_dl),
-    epochs=300,
-    batch_size=8,
-    callbacks=[early_stop, reduce_lr],
-    verbose=2
-)
+# Multi-task training if enabled
+if USE_SPECIALIZED_TRAINING and tcn_aux_train is not None:
+    print("  Using multi-task training with frequency change auxiliary task")
+    lstm_model.fit(
+        [X_train_dl, M_train_dl],
+        [y_train_dl, tcn_aux_train],  # Multi-task targets
+        validation_data=([X_val_dl, M_val_dl], [y_val_dl, tcn_aux_val]),
+        epochs=300,
+        batch_size=8,
+        callbacks=[early_stop, reduce_lr],
+        verbose=2
+    )
+else:
+    lstm_model.fit(
+        [X_train_dl, M_train_dl], y_train_dl,
+        validation_data=([X_val_dl, M_val_dl], y_val_dl),
+        epochs=300,
+        batch_size=8,
+        callbacks=[early_stop, reduce_lr],
+        verbose=2
+    )
 
 # Train Transformer Model
 print("Training Transformer model...")
 transformer_model = build_transformer_model(input_shape=X_train_dl.shape[1:], output_dim=40, meta_dim=M_train_dl.shape[1], final_dropout=0.35)
-transformer_model.fit(
-    [X_train_dl, M_train_dl], y_train_dl,
-    validation_data=([X_val_dl, M_val_dl], y_val_dl),
-    epochs=1000,
-    batch_size=8,
-    callbacks=[early_stop, reduce_lr],
-    verbose=2
-)
+# Multi-task training if enabled
+if USE_SPECIALIZED_TRAINING and transformer_aux_train is not None:
+    print("  Using multi-task training with future pattern auxiliary task")
+    transformer_model.fit(
+        [X_train_dl, M_train_dl],
+        [y_train_dl, transformer_aux_train],  # Multi-task targets
+        validation_data=([X_val_dl, M_val_dl], [y_val_dl, transformer_aux_val]),
+        epochs=1000,
+        batch_size=8,
+        callbacks=[early_stop, reduce_lr],
+        verbose=2
+    )
+else:
+    transformer_model.fit(
+        [X_train_dl, M_train_dl], y_train_dl,
+        validation_data=([X_val_dl, M_val_dl], y_val_dl),
+        epochs=1000,
+        batch_size=8,
+        callbacks=[early_stop, reduce_lr],
+        verbose=2
+    )
 
 # Train GNN Model
 print("Training GNN model...")
@@ -6244,17 +6425,43 @@ gnn_val_idx_end = n_draws - 1
 A_train_gnn, NF_train_gnn, M_train_gnn, y_train_gnn = prepare_gnn_data(gnn_train_idx_start, gnn_train_idx_end)
 A_val_gnn, NF_val_gnn, M_val_gnn, y_val_gnn = prepare_gnn_data(gnn_val_idx_start, gnn_val_idx_end)
 
+# Prepare GNN auxiliary targets if multi-task training is enabled
+if USE_SPECIALIZED_TRAINING and A_train_gnn is not None:
+    gnn_train_indices = list(range(gnn_train_idx_start, gnn_train_idx_end))
+    gnn_val_indices = list(range(gnn_val_idx_start, gnn_val_idx_end))
+    gnn_aux_train = prepare_gnn_aux_targets(draws, gnn_train_indices, window=30)
+    gnn_aux_val = prepare_gnn_aux_targets(draws, gnn_val_indices, window=30)
+    # Filter to match the actual samples (in case some were skipped due to errors)
+    gnn_aux_train = gnn_aux_train[:len(y_train_gnn)]
+    gnn_aux_val = gnn_aux_val[:len(y_val_gnn)]
+    print(f"  GNN aux targets: train {gnn_aux_train.shape}, val {gnn_aux_val.shape}")
+else:
+    gnn_aux_train = gnn_aux_val = None
+
 if A_train_gnn is not None and A_val_gnn is not None:
     gnn_model = build_gnn_model(num_nodes=40, node_feature_dim=5, meta_dim=3,
                                  hidden_dims=[64, 64, 32], final_dropout=0.35)
-    gnn_model.fit(
-        [NF_train_gnn, A_train_gnn, M_train_gnn], y_train_gnn,
-        validation_data=([NF_val_gnn, A_val_gnn, M_val_gnn], y_val_gnn),
-        epochs=300,
-        batch_size=8,
-        callbacks=[early_stop, reduce_lr],
-        verbose=2
-    )
+    # Multi-task training if enabled
+    if USE_SPECIALIZED_TRAINING and gnn_aux_train is not None:
+        print("  Using multi-task training with co-occurrence community auxiliary task")
+        gnn_model.fit(
+            [NF_train_gnn, A_train_gnn, M_train_gnn],
+            [y_train_gnn, gnn_aux_train],  # Multi-task targets
+            validation_data=([NF_val_gnn, A_val_gnn, M_val_gnn], [y_val_gnn, gnn_aux_val]),
+            epochs=300,
+            batch_size=8,
+            callbacks=[early_stop, reduce_lr],
+            verbose=2
+        )
+    else:
+        gnn_model.fit(
+            [NF_train_gnn, A_train_gnn, M_train_gnn], y_train_gnn,
+            validation_data=([NF_val_gnn, A_val_gnn, M_val_gnn], y_val_gnn),
+            epochs=300,
+            batch_size=8,
+            callbacks=[early_stop, reduce_lr],
+            verbose=2
+        )
     print("GNN model training complete.")
 else:
     print("Warning: Could not prepare GNN training data. GNN will use uniform predictions.")
@@ -6277,6 +6484,7 @@ def _prepare_recent_supervised(t_idx, window_min=FT_MIN, window_max=FT_MAX):
     """
     Build (X_recent, y_recent, M_recent) using only draws strictly before t_idx.
     We take the last [window_min..window_max] next-draw supervised pairs.
+    If USE_SPECIALIZED_TRAINING is enabled, also returns auxiliary targets.
     """
     _set_target_idx(t_idx)
     start_idx = max(k, t_idx - window_max)
@@ -6285,6 +6493,7 @@ def _prepare_recent_supervised(t_idx, window_min=FT_MIN, window_max=FT_MAX):
         start_idx = max(k, end_idx - window_min)
     Xr, yr = [], []
     Mr = []
+    indices = []
     for i in range(start_idx, end_idx):
         if i - k < 0:
             continue
@@ -6292,11 +6501,19 @@ def _prepare_recent_supervised(t_idx, window_min=FT_MIN, window_max=FT_MAX):
         Xr.append(feats)
         Mr.append(_meta_features_at_idx(i-1))
         yr.append([1 if n in draws[i] else 0 for n in range(1, 41)])
+        indices.append(i)
     if len(Xr) == 0:
         _set_target_idx(None)
-        return None, None, None
+        return None, None, None, None, None
     _set_target_idx(None)
-    return np.array(Xr), np.array(yr), np.array(Mr)
+
+    # Prepare auxiliary targets if multi-task training is enabled
+    if USE_SPECIALIZED_TRAINING:
+        tcn_aux = prepare_tcn_aux_targets(draws, indices, window=10)
+        transformer_aux = prepare_transformer_aux_targets(draws, indices, lookahead=2)
+        return np.array(Xr), np.array(yr), np.array(Mr), tcn_aux, transformer_aux
+    else:
+        return np.array(Xr), np.array(yr), np.array(Mr), None, None
 
 def _get_finetuned_nets(t_idx):
     """
@@ -6313,7 +6530,7 @@ def _get_finetuned_nets(t_idx):
         _set_target_idx(None)
         return _ft_cache[bin_key]
 
-    Xr, yr, Mr = _prepare_recent_supervised(t_idx)
+    Xr, yr, Mr, tcn_aux, transformer_aux = _prepare_recent_supervised(t_idx)
     if Xr is None or len(Xr) < FT_MIN:
         _set_target_idx(None)
         return lstm_model, transformer_model
@@ -6323,6 +6540,17 @@ def _get_finetuned_nets(t_idx):
     Xr_tr, Xr_val = Xr[:split], Xr[split:]
     yr_tr, yr_val = yr[:split], yr[split:]
     Mr_tr, Mr_val = Mr[:split], Mr[split:]
+
+    # Split auxiliary targets if available
+    if tcn_aux is not None:
+        tcn_aux_tr, tcn_aux_val = tcn_aux[:split], tcn_aux[split:]
+    else:
+        tcn_aux_tr = tcn_aux_val = None
+
+    if transformer_aux is not None:
+        transformer_aux_tr, transformer_aux_val = transformer_aux[:split], transformer_aux[split:]
+    else:
+        transformer_aux_tr = transformer_aux_val = None
 
     # Clone architectures and initialise from global weights
     tcnn_ft = build_tcnn_model(input_shape=X_train_dl.shape[1:], output_dim=40)
@@ -6359,11 +6587,22 @@ def _get_finetuned_nets(t_idx):
 
     es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=1, restore_best_weights=True)
     # Short fine-tune to avoid overfitting / keep cost low
-    tcnn_ft.fit([Xr_tr, Mr_tr], yr_tr, validation_data=([Xr_val, Mr_val], yr_val),
-                epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
+    # Use multi-task targets if available
+    if USE_SPECIALIZED_TRAINING and tcn_aux_tr is not None:
+        tcnn_ft.fit([Xr_tr, Mr_tr], [yr_tr, tcn_aux_tr],
+                    validation_data=([Xr_val, Mr_val], [yr_val, tcn_aux_val]),
+                    epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
+    else:
+        tcnn_ft.fit([Xr_tr, Mr_tr], yr_tr, validation_data=([Xr_val, Mr_val], yr_val),
+                    epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
 
-    trans_ft.fit([Xr_tr, Mr_tr], yr_tr, validation_data=([Xr_val, Mr_val], yr_val),
-                 epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
+    if USE_SPECIALIZED_TRAINING and transformer_aux_tr is not None:
+        trans_ft.fit([Xr_tr, Mr_tr], [yr_tr, transformer_aux_tr],
+                     validation_data=([Xr_val, Mr_val], [yr_val, transformer_aux_val]),
+                     epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
+    else:
+        trans_ft.fit([Xr_tr, Mr_tr], yr_tr, validation_data=([Xr_val, Mr_val], yr_val),
+                     epochs=FT_EPOCHS, batch_size=8, verbose=0, shuffle=True, callbacks=[es])
 
     _ft_cache[bin_key] = (tcnn_ft, trans_ft)
     _set_target_idx(None)
