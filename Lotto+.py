@@ -1050,7 +1050,7 @@ CONFIDENCE_MIN_EXPERTS = 1     # Minimum experts required (fallback to LSTM if l
 # NOTE: Multi-task training with auxiliary targets now fully implemented and enabled.
 # TCN learns frequency change trends, Transformer learns future patterns,
 # GNN learns co-occurrence communities for improved ensemble diversity.
-USE_SPECIALIZED_TRAINING = True  # Enable multi-task learning with specialized objectives
+USE_SPECIALIZED_TRAINING = False  # DISABLED - causes loss_weights mismatch with keras fit patch (see FIX notes)
 TCNN_AUX_WEIGHT = 0.15           # TCN: Frequency change prediction weight (0.85 main + 0.15 aux)
 TRANSFORMER_AUX_WEIGHT = 0.20    # Transformer: Future draw prediction weight (0.80 main + 0.20 aux)
 GNN_AUX_WEIGHT = 0.15            # GNN: Co-occurrence prediction weight (0.85 main + 0.15 aux)
@@ -5179,23 +5179,7 @@ def prepare_gnn_aux_targets(draws_data, indices, window=30, top_k=20):
 import tensorflow as tf
 import keras  # Keras 3.x API
 from keras import layers
-# --- Import-time training guard for Keras -----------------------------------
-try:
-    import keras as _k_guard
-    if hasattr(_k_guard, "Model") and hasattr(_k_guard.Model, "fit"):
-        _ORIG_KERAS_FIT = _k_guard.Model.fit
-        _FIT_WARNED = {"done": False}
-        def _FIT_GUARD(self, *args, **kwargs):
-            if __name__ == "__main__":
-                return _ORIG_KERAS_FIT(self, *args, **kwargs)
-            if not _FIT_WARNED["done"]:
-                warnings.warn("Skipped keras.Model.fit during import; guarded by __name__ check.")
-                _FIT_WARNED["done"] = True
-            return None
-        _k_guard.Model.fit = _FIT_GUARD
-except Exception:
-    pass
-# ---------------------------------------------------------------------------
+# NOTE: Removed duplicate _FIT_GUARD patch here - already patched at line ~3247
 
 def pl_set_loss_factory(R=12, tau=0.15, label_smoothing_eps=0.03, ls_weight=0.10):
     """
@@ -6430,20 +6414,7 @@ def train_setar_model(draws_hist, epochs=150, K=6, verbose=0, d_model=128, seed=
     import numpy as _np
     import random as _random
     from keras import layers as _L
-    # --- Import-time training guard for Keras -----------------------------------
-    try:
-        import keras as _k_guard
-        if hasattr(_k_guard, "Model") and hasattr(_k_guard.Model, "fit"):
-            _ORIG_KERAS_FIT = _k_guard.Model.fit
-            def _FIT_GUARD(self, *args, **kwargs):
-                if __name__ == "__main__":
-                    return _ORIG_KERAS_FIT(self, *args, **kwargs)
-                warnings.warn("Skipped keras.Model.fit during import; guarded by __name__ check.")
-                return None
-            _k_guard.Model.fit = _FIT_GUARD
-    except Exception:
-        pass
-    # ---------------------------------------------------------------------------
+    # NOTE: Removed duplicate _FIT_GUARD patch - already patched at module level (line ~3247)
     BOS = 0
     V = 41  # 0..40 (0=BOS)
 
